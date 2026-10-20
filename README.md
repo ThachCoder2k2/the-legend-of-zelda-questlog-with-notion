@@ -47,7 +47,8 @@ questlog-weekly-reset.
   orange "!" on the icon: amber under 24 h, orange under 3 h, red and blinking under 1 h or overdue (the ring turns coral);
   the right-click menu lists those quests with a countdown and opens them. Levels come from the clock, so they work offline.
   Filled from the Quests "Due" property (see "Deadlines" below).
-- Files: `urgent.py` (deadlines and their escalation ladder), `qlstate.py` (windows, stamps, claim locks, saved cards, mode), `QuestBar.swift` → `questbar`
+- A saved card shown the next day relabels its days ("Yesterday · Mon 19/10", "Today · Tue 20/10") instead of saying "Tomorrow" for today.
+- Files: `quickadd.py` (the "Add deadline…" line), `set-notion-token.command` (token setup), `urgent.py` (deadlines and their escalation ladder), `qlstate.py` (windows, stamps, claim locks, saved cards, mode), `QuestBar.swift` → `questbar`
   (`swiftc -O QuestBar.swift -o questbar -framework Cocoa -framework Carbon`), logs in `runs/`.
   `report.py install` loads: the three daily agents, `com.questlog.catchup`, `com.questlog.bar`; `uninstall` removes them.
   A true desktop widget (WidgetKit) would need a signed app extension built in Xcode; the menu-bar button covers the same use.
@@ -69,6 +70,16 @@ The urgent card is red, compact, with **Start** (T, tracks the quest), **Done** 
 Rules: each step shows once; a quest you track (🔥 Grinding) keeps the steps but loses the repeats; a quest you clear on a card
 disappears at once; alerts wait until you are at the Mac, and only the 15-minute and overdue steps may replace a card that is open;
 the routine time windows do not apply. Several deadlines in one step come as one card.
+
+**Add deadline…** (right-click the button, or **⌃⌥D** anywhere): type one line and it becomes a 🧩 Side Quest in Notion with its
+Due, planned on the day it is due, and goes on the deadline list at once (`report.py add`, parsed by `quickadd.py`):
+`Submit visa form, tomorrow 9am` · `Pay rent in 3h` · `Report, fri 17:00` · `Call the bank, 26/10 10:30` · `Renew passport 2026-11-05`
+(a day without a time = until 23:59; a bare time = the next time the clock shows it; `17h` = 17:00, `3h` = in three hours).
+It needs the token with Insert content. If the line can't be read, the box comes back with your text.
+
+On the cards, **Move to tomorrow** says "· after its deadline" (and a toast) when the new day is later than the quest's Due.
+The weekly reset never moves a quest past its Due (rule 3-0 in its prompt: deadline quests are placed first, the day before
+the deadline when possible, and anything overdue or sharing a Main day is reported).
 
 Where the list comes from (`runs/urgent.json`): `report.py refresh` (the catch-up agent runs it every 10 minutes, and every card the
 local runner builds refreshes it) needs the Notion token; without the token the three daily Claude tasks fill it through
@@ -113,11 +124,12 @@ The card has no Notion access of its own, so a click is saved one of two ways:
    (07:30, 12:00, 22:00, Sunday 22:30) applies it through the Notion connector first thing.
 2. **Instant (optional):** give the card its own Notion integration token.
    1. Notion → Settings → Connections → Develop or manage integrations → New integration
-      (internal, your workspace, capabilities: Read + Update content). Copy the secret.
+      (internal, your workspace, capabilities: Read, Update **and Insert** content; Insert is what "Add deadline…" needs). Copy the secret.
    2. Open the page **🗂️ Quest Log Data** → ••• → Connections → add that integration. That page holds the
       Quests and Questlines databases; it is a separate top-level page, so connecting only the Quest Log board
       page is not enough (every call would fail with 404).
-   3. In Terminal: `security add-generic-password -s "QuestLog Notion" -a token -w`
+   3. Right-click the menu-bar button, "⚠ Notion isn't connected: set it up…" (shown while the token is missing; it opens
+      `set-notion-token.command` in Terminal), or run yourself `security add-generic-password -U -s "QuestLog Notion" -a token -w`
       (it asks for the secret; paste it there, so it never lands in shell history).
    Remove it with `security delete-generic-password -s "QuestLog Notion" -a token`.
    If Notion cannot be reached, the click falls back to the queue.

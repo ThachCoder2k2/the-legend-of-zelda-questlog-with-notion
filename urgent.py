@@ -211,6 +211,7 @@ def build_card(alerts, now):
         d = parse_due(it["due"])
         c = {"type": it["type"], "title": it["title"], "url": it["url"], "status": it.get("status") or "📜 To Do",
              "label": left_text((d - now).total_seconds()), "tags": ["Due " + due_label(d, now)]}
+        c["due"] = it["due"]
         if it.get("date"):
             c["date"] = it["date"]
         if it.get("start"):

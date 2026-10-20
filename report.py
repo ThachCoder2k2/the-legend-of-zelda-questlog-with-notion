@@ -29,6 +29,8 @@ Notion"). Python 3.9+ standard library only.
                                        or the local runner is live and shows it)
   python3 report.py status             mode, token, which cards were shown today, the saved cards
   python3 report.py refresh            read the quests that have a Due date into runs/urgent.json (needs the token)
+  python3 report.py add -- "TITLE, WHEN"  create a deadline quest in Notion (the menu bar's "Add deadline…"); WHEN reads
+                                       "tomorrow 9am", "fri 17:00", "in 3h", "26/10 10:30" (quickadd.py); --dry-run only parses
   python3 report.py urgent [tick|list|snooze MIN|clear] [--force] [--dry-run]
                                        deadlines: show the urgent card if a step of the ladder is due (urgent.py)
   python3 report.py install [--live]   write and load the LaunchAgents (07:30, 12:00, 22:00 + catch-up + menu-bar button);
@@ -58,6 +60,7 @@ sys.path.insert(0, HERE)
 sys.dont_write_bytecode = True
 import pending  # noqa: E402  (pending.json / applied.json helpers next to this file)
 import qlstate  # noqa: E402  (windows, shown stamps, claim locks, last-card cache, mode)
+import quickadd  # noqa: E402  (the "Add deadline…" line: title, when)
 import urgent  # noqa: E402  (deadlines: urgent.json, the escalation ladder)
 from qlstate import TIMES, WINDOW, scheduled_day  # noqa: E402,F401
 
@@ -309,6 +312,51 @@ def refresh_deadlines():
     return 0
 
 
+def add_cmd(rest, args):
+    """`report.py add -- "Submit visa form, tomorrow 9am"`: create the quest in Notion with its Due and put it on the
+    deadline list at once. Exit 0 = added (one line on stdout), 2 = couldn't read the line, 3 = no Notion token,
+    1 = Notion said no (the message is on stderr)."""
+    now = _at(args).astimezone()
+    try:
+        title, due, has_time = quickadd.parse(" ".join(rest), now)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 2
+    props = {
+        "Quest": {"title": [{"text": {"content": title}}]},
+        "Type": {"select": {"name": SIDE}},
+        "Status": {"status": {"name": TODO}},
+        "Date": {"date": {"start": due.date().isoformat()}},   # planned for the day it is due; move it earlier on the board
+        "Due": {"date": {"start": due.isoformat(timespec="seconds") if has_time else due.date().isoformat()}},
+    }
+    shown = urgent.due_label(due, now) if has_time else urgent.due_label(due, now).rsplit(" ", 1)[0] + " (any time)"
+    if args.dry_run:
+        print(json.dumps({"title": title, "due": props["Due"]["date"]["start"], "shown": shown}, ensure_ascii=False))
+        return 0
+    token = read_token()
+    if not token:
+        print("The Notion token is not saved yet, so I can't create the quest.", file=sys.stderr)
+        return 3
+    global INTERACTIVE
+    INTERACTIVE = True
+    try:
+        page = notion(token, "POST", "/pages", {"parent": {"database_id": QUESTS_DB}, "properties": props})
+    except NotionError as e:
+        hint = (" Give the integration the Insert content capability (Notion, Settings, Connections, your integration)."
+                if e.code in (401, 403) else "")
+        print(f"Notion said no: {e}.{hint}", file=sys.stderr)
+        return 1
+    qid = page["id"].replace("-", "")
+    try:
+        urgent.save(urgent.load() + [{"id": qid, "title": title, "due": props["Due"]["date"]["start"], "type": "side",
+                                      "status": TODO, "date": due.date().isoformat()}])
+    except Exception as e:  # noqa: BLE001  the quest exists in Notion; the next refresh picks it up
+        log(f"add: deadline list not updated: {e!r}")
+    log(f"add: {title!r} due {props['Due']['date']['start']}")
+    print(f"Added: {title} · due {shown}")
+    return 0
+
+
 def deadline_tick(now=None):
     """Refresh the list, then show the urgent card if a step of the ladder is due."""
     try:
@@ -442,6 +490,8 @@ def item(r, data, pool, tags=None, **flags):
     it["status"] = r["status"]
     if r["date"]:
         it["date"] = r["date"]
+    if d:
+        it["due"] = r["due"]   # the card warns before "Move to tomorrow" lands after it
     if start_text(r["start"]):
         it["start"] = start_text(r["start"])
     if r["questlines"]:
@@ -801,7 +851,7 @@ def now_cmd(rest, args):
             fallback = cached or qlstate.newest_saved()  # this kind's last card, else the newest of any kind
             fsaved = qlstate.saved_at(fallback) if fallback else None
             if fallback and fsaved:
-                card = dict(fallback)
+                card = relabel_saved(dict(fallback), fsaved.astimezone().replace(tzinfo=None), now)
                 card["eyebrow"] = f"Saved {qlstate.age_text(fsaved)} · {card.get('eyebrow', kind.title())}"
                 card["note"] = "Couldn't reach Notion, so this is the last saved card. Changes you make are queued."
             else:
@@ -813,6 +863,33 @@ def now_cmd(rest, args):
         return 0
     finally:
         qlstate.release(date.today(), "now")
+
+
+def relabel_saved(card, saved, now):
+    """A saved card says "Today" and "Tomorrow" for the day it was made. Shown the next day it would call today
+    "Tomorrow", so name the days instead: "Yesterday · Mon 19/10", "Today · Tue 20/10". `saved` and `now` are naive local."""
+    if card.get("kind") not in TIMES:
+        return card
+    base = qlstate.kind_for_now(saved)[1]   # the day the card is for (an evening report after midnight is still yesterday's)
+    today = now.date()
+    if base >= today:
+        return card
+
+    def heading(h):
+        h = str(h or "")
+        if h == "Today":
+            return ("Yesterday · " if base == today - timedelta(days=1) else "") + label(base)
+        if h.startswith("Tomorrow · "):
+            rest = h[len("Tomorrow · "):]
+            return ("Today · " + rest) if base + timedelta(days=1) == today else rest
+        return h
+
+    out = dict(card)
+    out["sections"] = [dict(sec, heading=heading(sec.get("heading"))) for sec in card.get("sections") or []]
+    title = str(card.get("title") or "")
+    if title.startswith("Tomorrow") and base + timedelta(days=1) == today:
+        out["title"] = "Today" + title[len("Tomorrow"):]
+    return out
 
 
 def _no_card(kind, title, text):
@@ -1122,7 +1199,24 @@ def uninstall():
     return 0
 
 
+def main_add(rest):
+    """`add [--dry-run] [--at "YYYY-MM-DD HH:MM"] [--] TEXT…`, read by hand: the text is free-form and may start with a dash."""
+    ns = argparse.Namespace(dry_run=False, at=None)
+    while rest and rest[0] in ("--dry-run", "--at"):
+        if rest[0] == "--dry-run":
+            ns.dry_run, rest = True, rest[1:]
+        elif len(rest) > 1:
+            ns.at, rest = rest[1], rest[2:]
+        else:
+            sys.exit("--at needs a value")
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+    return add_cmd(rest, ns)
+
+
 def main(argv):
+    if len(argv) > 1 and argv[1] == "add":
+        return main_add(argv[2:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, usage=argparse.SUPPRESS)
     ap.add_argument("cmd", choices=["morning", "midday", "evening", "shadow", "compare", "install", "uninstall", "check",
                                     "now", "catchup", "gate", "status", "refresh", "urgent"])

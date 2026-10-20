@@ -1,8 +1,9 @@
 // QuestBar: the Quest Log button in the menu bar, the "widget" that opens the card any time.
 //
 //   click          open the Quest Log card for the time of day (live from Notion, or the last saved card offline)
-//   right-click    menu: Morning / Midday / Evening / Weekly, the Notion board, Quit
+//   right-click    menu: urgent deadlines, Add deadline…, Morning / Midday / Evening / Weekly, the Notion board, Quit
 //   ⌃⌥Q            the same as a click, from anywhere
+//   ⌃⌥D            Add deadline…: one line ("Submit visa form, tomorrow 9am") becomes a quest with a Due in Notion
 //
 // The badge next to the icon is today's cleared/total (runs/status.json, written whenever a morning or evening card
 // is shown). The app does no networking: every click runs `report.py now`, which does the work.
@@ -21,7 +22,8 @@ let statusFile = folder.appendingPathComponent("runs/status.json")
 let urgentFile = folder.appendingPathComponent("runs/urgent.json")
 let logFile = folder.appendingPathComponent("runs/bar.log")
 
-var onHotKey: (() -> Void)?
+var hotKeyActions: [UInt32: () -> Void] = [:]   // by EventHotKeyID.id
+let setupScript = folder.appendingPathComponent("set-notion-token.command")
 
 /// A quest with a deadline (runs/urgent.json: {"items": [{"title", "due", "url"}]}; due = ISO-8601 with time, or a plain
 /// date meaning the end of that day). How close it is decides the colour of the "!" badge on the icon.
@@ -68,6 +70,13 @@ final class Bar: NSObject, NSApplicationDelegate {
     var running: [Process] = []
     var lastCatchUp = Date.distantPast
     var lastUrgentTick = Date.distantPast
+    var notionOK = true            // the Notion token is in the Keychain (checked at most once a minute)
+    var lastTokenCheck = Date.distantPast
+    var flash: (text: String, until: Date)?   // a short confirmation next to the icon ("✓ added")
+    var addHotKey: EventHotKeyRef?
+    var addOpen = false            // the Add deadline box is on screen
+    var retryText = ""              // what was typed when the line wasn't understood: put back in the box
+    var tooltipNote = ""            // what the last add said, until the next refresh of the tooltip
     var lastOpen = Date.distantPast
     var urgent: [Urgent] = []      // soonest deadline first
     var pulse = true               // the red "!" blinks
@@ -168,10 +177,20 @@ final class Bar: NSObject, NSApplicationDelegate {
             menu.addItem(m)
         }
         if urgent.contains(where: { $0.level() > 0 }) { menu.addItem(.separator()) }
+        if !notionOK {
+            let m = NSMenuItem(title: "⚠  Notion isn't connected: set it up…", action: #selector(openSetup), keyEquivalent: "")
+            m.target = self
+            menu.addItem(m)
+            menu.addItem(.separator())
+        }
         let open = NSMenuItem(title: "Open Quest Log", action: #selector(openDefault), keyEquivalent: "q")
         open.keyEquivalentModifierMask = [.control, .option]
         open.target = self
         menu.addItem(open)
+        let add = NSMenuItem(title: "Add deadline…", action: #selector(addDeadline), keyEquivalent: "d")
+        add.keyEquivalentModifierMask = [.control, .option]
+        add.target = self
+        menu.addItem(add)
         menu.addItem(.separator())
         for (title, kind) in [("Morning briefing", "morning"), ("Midday check", "midday"), ("Evening report", "evening"), ("Weekly reset (last one)", "weekly")] {
             let m = NSMenuItem(title: title, action: #selector(openKind(_:)), keyEquivalent: "")
@@ -203,13 +222,22 @@ final class Bar: NSObject, NSApplicationDelegate {
             tip = "Quest Log: \(done) of \(total) quests cleared\(asOf) · click to open"
         }
         if !running.isEmpty { text = " …" }   // a click is being served (building the card can take a few seconds)
+        checkToken()
+        if !notionOK {
+            text += " ⚠"
+            tip = "Quest Log: Notion isn't connected (no token in the Keychain), so live cards, deadlines and quick add are off · right-click to set it up"
+        }
+        if let f = flash, f.until > Date() {
+            text = " " + f.text
+            if !tooltipNote.isEmpty { tip = tooltipNote }
+        } else { flash = nil }
         loadUrgent()
         let worst = urgent.first?.level() ?? 0
         if let first = urgent.first, worst > 0 {
             let more = urgent.filter { $0.level() > 0 }.count - 1
             tip = "! \(first.title): \(first.countdown())" + (more > 0 ? " (+\(more) more)" : "") + " · click to open"
         }
-        let key = "\(text == " ✓")-\(worst)-\(worst >= 3 ? pulse : true)"
+        let key = "\(text == " ✓")-\(worst)-\(worst >= 3 ? pulse : true)-\(notionOK)"
         if key != lastIconKey {   // redraw only when something changed
             lastIconKey = key
             item.button?.image = icon(done: text == " ✓", level: worst, pulse: pulse)
@@ -234,6 +262,126 @@ final class Bar: NSObject, NSApplicationDelegate {
             }
         }
         urgent = items.sorted { $0.due < $1.due }
+    }
+
+    /// Is the Notion token saved? Asks `security` for the item's attributes only (never the secret), at most once a minute.
+    func checkToken() {
+        guard Date().timeIntervalSince(lastTokenCheck) >= 60 else { return }
+        lastTokenCheck = Date()
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        p.arguments = ["find-generic-password", "-s", "QuestLog Notion", "-a", "token"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run()
+            p.waitUntilExit()
+            notionOK = p.terminationStatus == 0
+        } catch {
+            notionOK = true   // can't tell: don't nag
+        }
+    }
+
+    /// Opens set-notion-token.command in Terminal: the token is typed there, so it never passes through this app.
+    @objc func openSetup() {
+        NSWorkspace.shared.open(setupScript)
+        lastTokenCheck = Date.distantPast   // look again soon: it may be saved in a minute
+    }
+
+    /// Centre a dialog on the screen the mouse is on (an alert of this menu-bar app would otherwise open on whichever display it picks).
+    func centre(_ alert: NSAlert) {
+        alert.layout()
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main ?? NSScreen.screens[0]
+        let size = alert.window.frame.size
+        let area = screen.visibleFrame
+        alert.window.setFrameOrigin(NSPoint(x: area.midX - size.width / 2, y: area.midY - size.height / 2 + area.height * 0.12))
+    }
+
+    /// ⌃⌥D / menu: one line, "title, when", becomes a quest with a Due in Notion (`report.py add`).
+    @objc func addDeadline() {
+        if addOpen { return }
+        addOpen = true
+        defer { addOpen = false }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.icon = icon(done: false, level: 0, pulse: true)   // the quest marker instead of a generic folder
+        alert.messageText = "Add a deadline"
+        alert.informativeText = "Title, then when it is due:\n  Submit visa form, tomorrow 9am\n  Pay rent in 3h\n  Report, fri 17:00\n  Call the bank, 26/10 10:30"
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        field.placeholderString = "Submit visa form, tomorrow 9am"
+        field.stringValue = retryText
+        retryText = ""
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        alert.window.level = .floating
+        centre(alert)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty { runAdd(text) }
+    }
+
+    func runAdd(_ text: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: python)
+        p.arguments = [reportPy, "add", "--", text]
+        p.environment = ["PYTHONIOENCODING": "utf-8", "LANG": "en_US.UTF-8", "HOME": NSHomeDirectory(), "PATH": "/usr/bin:/bin"]
+        let out = Pipe(), err = Pipe()
+        p.standardOutput = out
+        p.standardError = err
+        p.terminationHandler = { [weak self] done in
+            let said = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let complained = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.running.removeAll { $0 === done }
+                if done.terminationStatus == 0 {
+                    self.flash = ("✓ added", Date().addingTimeInterval(4))
+                    self.tooltipNote = said.trimmingCharacters(in: .whitespacesAndNewlines)
+                    NSSound(named: NSSound.Name("Glass"))?.play()
+                } else {
+                    self.failedAdd(text: text, code: done.terminationStatus, message: complained.trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+                self.lastIconKey = ""   // redraw the icon and the menu with the new deadline
+                self.refresh()
+            }
+        }
+        do {
+            try p.run()
+            running.append(p)
+            refresh()
+        } catch {
+            NSSound.beep()
+        }
+    }
+
+    /// exit 2 = the line wasn't understood (ask again, with the text kept), 3 = no token (offer the setup), else Notion's message.
+    func failedAdd(text: String, code: Int32, message: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.icon = icon(done: false, level: 0, pulse: true)
+        alert.messageText = code == 2 ? "Couldn't read that" : code == 3 ? "Notion isn't connected" : "Couldn't add the deadline"
+        alert.informativeText = message.isEmpty ? "Something went wrong. See runs/bar.log." : message
+        alert.window.level = .floating
+        centre(alert)
+        if code == 3 {
+            alert.addButton(withTitle: "Set up…")
+            alert.addButton(withTitle: "Cancel")
+            if alert.runModal() == .alertFirstButtonReturn { openSetup() }
+        } else if code == 2 {
+            alert.addButton(withTitle: "Try again")
+            alert.addButton(withTitle: "Cancel")
+            if alert.runModal() == .alertFirstButtonReturn {
+                retryText = text
+                DispatchQueue.main.async { self.addDeadline() }
+            }
+        } else {
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
     }
 
     @objc func openUrgent(_ sender: NSMenuItem) {
@@ -351,16 +499,23 @@ final class Bar: NSObject, NSApplicationDelegate {
         return h ?? FileHandle.nullDevice
     }
 
-    /// ⌃⌥Q anywhere. RegisterEventHotKey needs no Accessibility permission.
+    /// ⌃⌥Q (open the card) and ⌃⌥D (add a deadline) anywhere. RegisterEventHotKey needs no Accessibility permission.
     func registerHotKey() {
-        onHotKey = { [weak self] in self?.openNow(nil) }
+        hotKeyActions[1] = { [weak self] in self?.openNow(nil) }
+        hotKeyActions[2] = { [weak self] in self?.addDeadline() }
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            onHotKey?()
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+            var id = EventHotKeyID()
+            let status = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                           nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
+            if status == noErr { hotKeyActions[id.id]?() }
             return noErr
         }, 1, &spec, nil, nil)
-        let id = EventHotKeyID(signature: OSType(0x514C_4F47), id: 1)   // 'QLOG'
-        RegisterEventHotKey(UInt32(kVK_ANSI_Q), UInt32(controlKey | optionKey), id, GetApplicationEventTarget(), 0, &hotKey)
+        let sig = OSType(0x514C_4F47)   // 'QLOG'
+        RegisterEventHotKey(UInt32(kVK_ANSI_Q), UInt32(controlKey | optionKey), EventHotKeyID(signature: sig, id: 1),
+                            GetApplicationEventTarget(), 0, &hotKey)
+        RegisterEventHotKey(UInt32(kVK_ANSI_D), UInt32(controlKey | optionKey), EventHotKeyID(signature: sig, id: 2),
+                            GetApplicationEventTarget(), 0, &addHotKey)
     }
 }
 

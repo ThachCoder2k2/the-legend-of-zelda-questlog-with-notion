@@ -348,6 +348,7 @@
   .mi.c-done .g { color: var(--mint); } .mi.c-live .g { color: #FFB45C; } .mi.c-move .g { color: var(--gloom); }
   .mi.c-todo .g { color: var(--ui-cyan); } .mi.c-undo .g { color: var(--cream-grey); } .mi.c-open .g { color: var(--ui-cyan); }
   .mi .lbl { flex: 1; white-space: nowrap; }
+  .mi.warn .lbl { color: #FFB59E; } .mi.warn .g { color: #FF8A66; }
   .mi .now { font-size: 10.5px; font-weight: 500; color: var(--cream-grey); }
   .mi.current { opacity: .45; cursor: default; }
   .mi.on { border-color: var(--gold); color: var(--text-selected); background: linear-gradient(90deg, rgba(4,32,58,.9), transparent);
@@ -696,9 +697,6 @@
     box-shadow: 0 0 0 1px rgba(2,189,247,.15), 0 0 46px rgba(42,180,224,.28), inset 0 0 70px rgba(42,180,224,.10);
     animation: fullin .32s cubic-bezier(.2,.8,.2,1) both; }
   @keyframes fullin { from { opacity: 0; transform: scale(.97); } }
-  body.full .stage::before, body.full .stage::after { content: ""; position: absolute; top: 9%; bottom: 9%; width: 56px; border-radius: 28px;
-    pointer-events: none; opacity: .6; background: repeating-radial-gradient(circle at 50% 50%, rgba(130,136,138,.55) 0 3px, rgba(40,44,46,.65) 3px 7px) 0 0 / 56px 56px; }
-  body.full .stage::before { left: -42px; } body.full .stage::after { right: -42px; }
   body.full .stage > .tabs { grid-column: 1 / -1; grid-row: 1; height: 48px; margin: 0 -26px; gap: 34px; font-size: 14.5px; border-radius: 24px 24px 0 0;
     background: linear-gradient(180deg, rgba(6,49,77,.9), rgba(4,36,58,.35)); cursor: default; }
   body.full .tabs .key { width: 18px; height: 16px; font-size: 10px; }
@@ -1426,15 +1424,22 @@
   /* ---------- action menu (TOTK item command list) ---------- */
   const menu = el("div", "menu"); menu.setAttribute("role", "menu"); menu.hidden = true;
   let menuRow = null, menuItems = [], menuSel = -1;
+  // a quest's Due as a local YYYY-MM-DD (a date without a time counts for that whole day), or null
+  const dueDay = (r) => {
+    const v = r.it.due; if (!v) return null;
+    const d = /^\d{4}-\d{2}-\d{2}$/.test(v) ? parseIso(v) : new Date(v);
+    return d && !isNaN(d) ? isoOf(d) : null;
+  };
   const choices = (r) => {
     const t = todayIso();
     const base = r.now.date && r.now.date > t ? r.now.date : t;
     const tomorrow = nextDayIso(base);
     const keepDate = r.now.date;
+    const dd = r.done ? null : dueDay(r), late = !!dd && tomorrow > dd;   // moving past the Due: say so
     const list = [
       { key: "done", label: "Clear", glyph: G.check, target: { status: STATUS.done, date: keepDate } },
       { key: "live", label: "Track (in progress)", glyph: G.track, target: { status: STATUS.grinding, date: keepDate } },
-      { key: "move", label: "Move to " + dayLabel(tomorrow), glyph: G.next, target: { status: STATUS.todo, date: tomorrow } },
+      { key: "move", label: "Move to " + dayLabel(tomorrow) + (late ? " · after its deadline" : ""), warn: late, glyph: G.next, target: { status: STATUS.todo, date: tomorrow } },
       { key: "todo", label: "To do", glyph: G.box, target: { status: STATUS.todo, date: keepDate } },
     ].filter(c => c.key !== "move" || r.orig.date);   // moving needs the quest's date so it can be undone
     list.forEach(c => { c.current = c.target.status === r.now.status && (c.target.date || null) === (r.now.date || null); });
@@ -1461,7 +1466,7 @@
     menu.textContent = "";
     menuItems = choices(r).map((c, i) => {
       if (c.sep) menu.appendChild(el("i", "msep"));
-      const b = noFocus(el("button", "mi c-" + c.key + (c.current ? " current" : "")));
+      const b = noFocus(el("button", "mi c-" + c.key + (c.current ? " current" : "") + (c.warn ? " warn" : "")));
       b.type = "button"; b.setAttribute("role", "menuitem");
       b.appendChild(svgEl(c.glyph, "g"));
       b.appendChild(el("span", "lbl", c.label));
@@ -1501,7 +1506,7 @@
     const r = menuRow;
     closeMenu(false);
     if (m.c.key === "open") openRow(r);
-    else apply(r, m.c.target);
+    else { apply(r, m.c.target); if (m.c.warn) toast("Past its deadline: due " + dayLabel(dueDay(r))); }
   };
 
   /* ---------- quest detail (TOTK Adventure Log entry) ---------- */

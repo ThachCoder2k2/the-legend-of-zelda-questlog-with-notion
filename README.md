@@ -102,6 +102,12 @@ local runner builds refreshes it) needs the Notion token; without the token the 
 Commands: `python3 urgent.py list | tick [--force] [--dry-run] | snooze [MIN] | set (JSON on stdin) | clear`.
 Preview the card: `card.html?kind=urgent`.
 
+## Tests
+
+`tests/run.sh` runs the whole suite (about 200 checks: time windows, catch-up, locks, deadlines, quick add, push, evening numbers…)
+in a throw-away sandbox: a temp copy of the scripts, a fake `questcard` and `osascript`, the network stubbed. It touches no real
+state and sends nothing to Notion or ntfy.sh. It needs only `/usr/bin/python3`.
+
 ## Full screen (default)
 
 The card opens full screen like the Purah Pad menu: tabs on top, quest list on the left, the detail panel

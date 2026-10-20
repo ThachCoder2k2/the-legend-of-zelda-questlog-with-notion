@@ -22,11 +22,15 @@ Notion"). Python 3.9+ standard library only.
   python3 report.py now [KIND]         open a card right now (the menu-bar button): the live card, or the last saved one
                                        when Notion is unreachable. KIND defaults to the one for the time of day
                                        (morning / midday / evening / weekly = the last weekly card)
-  python3 report.py catchup            LaunchAgent (at login and every 10 min): show the one card that is due and unseen
-                                       once you are back at the Mac (not while another card is open); live mode only
+  python3 report.py catchup            LaunchAgent (at login and every 10 min): refresh the deadlines and show the urgent
+                                       card if one is due; show the one card that is due and unseen once you are back at
+                                       the Mac (not while another card is open); live mode only
   python3 report.py gate KIND          for the Claude tasks: "go DATE" or "skip: why" (outside the window, already shown,
                                        or the local runner is live and shows it)
   python3 report.py status             mode, token, which cards were shown today, the saved cards
+  python3 report.py refresh            read the quests that have a Due date into runs/urgent.json (needs the token)
+  python3 report.py urgent [tick|list|snooze MIN|clear] [--force] [--dry-run]
+                                       deadlines: show the urgent card if a step of the ladder is due (urgent.py)
   python3 report.py install [--live]   write and load the LaunchAgents (07:30, 12:00, 22:00 + catch-up + menu-bar button);
                                        shadow mode by default, --live makes the local runner show the cards
   python3 report.py uninstall          unload and remove them
@@ -54,6 +58,7 @@ sys.path.insert(0, HERE)
 sys.dont_write_bytecode = True
 import pending  # noqa: E402  (pending.json / applied.json helpers next to this file)
 import qlstate  # noqa: E402  (windows, shown stamps, claim locks, last-card cache, mode)
+import urgent  # noqa: E402  (deadlines: urgent.json, the escalation ladder)
 from qlstate import TIMES, WINDOW, scheduled_day  # noqa: E402,F401
 
 RUNS = os.path.join(HERE, "runs")
@@ -261,12 +266,60 @@ def quest_row(page):
         "type": name(get("Type", "select")),
         "status": name(get("Status", "status")),
         "date": ((get("Date", "date") or {}).get("start") or "")[:10] or None,
+        "due": (get("Due", "date") or {}).get("start") or None,
         "energy": name(get("Energy", "select")),
         "start": plain(get("2-Min Start", "rich_text")),
         "questlines": [r["id"].replace("-", "") for r in get("Questline", "relation") or []],
         "edited": get("Edited", "last_edited_time") or page.get("last_edited_time"),
         "on_today": (get("On Today", "formula") or {}).get("string"),
     }
+
+
+def urgent_items(rows):
+    """The quests with a Due date that are still open (Locked ones are not yours to act on)."""
+    return [{"id": r["id"], "title": r["title"], "due": r["due"], "type": TYPE.get(r["type"], "side"), "status": r["status"],
+             "start": start_text(r["start"]), "date": r["date"]}
+            for r in rows if r.get("due") and r["title"] and r["status"] != CLEARED and r["energy"] != LOCKED]
+
+
+def sync_deadlines(rows):
+    """Every card the local runner builds has read all the quests anyway: keep runs/urgent.json (the "!" badge) fresh."""
+    try:
+        urgent.save(urgent_items(rows))
+    except Exception as e:  # noqa: BLE001  a deadline list problem must never stop a card
+        log(f"deadlines not saved: {e!r}")
+
+
+def refresh_deadlines():
+    """Read the quests with a Due date from Notion into runs/urgent.json. Needs the token; 0 also when there is none
+    (the Claude tasks fill the list through `urgent.py set` then)."""
+    token = read_token()
+    if not token:
+        return 0
+    try:
+        pages = query_all(token, QUESTS_DB, {"filter": {"and": [
+            {"property": "Due", "date": {"is_not_empty": True}},
+            {"property": "Status", "status": {"does_not_equal": CLEARED}}]}})
+    except NotionError as e:
+        log(f"deadlines: {e}")
+        return 1
+    rows = [quest_row(pg) for pg in pages]
+    items = urgent.save(urgent_items(rows))
+    log(f"deadlines: {len(items)} open")
+    return 0
+
+
+def deadline_tick(now=None):
+    """Refresh the list, then show the urgent card if a step of the ladder is due."""
+    try:
+        refresh_deadlines()
+    except Exception as e:  # noqa: BLE001
+        log(f"deadlines: unexpected {e!r}")
+    try:
+        return urgent.tick(now=now.astimezone() if now else None)
+    except Exception as e:  # noqa: BLE001
+        log(f"urgent: unexpected {e!r}")
+        return 1
 
 
 def fetch(token):
@@ -378,6 +431,10 @@ def steps(shown, qid, pool):
 
 def item(r, data, pool, tags=None, **flags):
     it = {"type": TYPE.get(r["type"], "side"), "title": r["title"]}
+    tags = list(tags or [])
+    d = urgent.parse_due(r.get("due")) if r.get("status") != CLEARED else None
+    if d:
+        tags.append("Due " + urgent.due_label(d, datetime.now().astimezone()))
     if tags:
         it["tags"] = tags
     it.update({k: True for k, v in flags.items() if v})
@@ -547,6 +604,8 @@ def make_card(kind, T, dry, fixture=None, save_fixture=None):
         if not dry:
             apply_queue(token)
         data = fetch(token)
+        if not dry:
+            sync_deadlines(data["rows"])
         if save_fixture:
             with open(save_fixture, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=1)
@@ -764,6 +823,8 @@ def _no_card(kind, title, text):
 def catchup(args):
     """After sleep, a shutdown or a late login: show the one card that is due and unseen, once the user is back."""
     now = _at(args)
+    if not args.dry_run:
+        deadline_tick(now if args.at else None)   # deadlines come first: the ladder has its own presence rules
     wanted = qlstate.due(now)
     if not wanted:
         log("catchup: nothing due")
@@ -1064,7 +1125,7 @@ def uninstall():
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, usage=argparse.SUPPRESS)
     ap.add_argument("cmd", choices=["morning", "midday", "evening", "shadow", "compare", "install", "uninstall", "check",
-                                    "now", "catchup", "gate", "status"])
+                                    "now", "catchup", "gate", "status", "refresh", "urgent"])
     ap.add_argument("rest", nargs="*")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--today")
@@ -1089,6 +1150,11 @@ def main(argv):
         return gate(args.rest[0], args)
     if args.cmd == "status":
         return status_cmd()
+    if args.cmd == "refresh":
+        return refresh_deadlines()
+    if args.cmd == "urgent":   # report.py urgent [tick|list|snooze MIN|clear] [--force] [--dry-run]
+        extra = (["--force"] if args.force else []) + (["--dry-run"] if args.dry_run else [])
+        return urgent.main(["urgent.py", *(args.rest or ["tick"]), *(extra if (args.rest or ["tick"])[0] == "tick" else [])])
     if args.cmd == "shadow":
         if not args.rest or args.rest[0] not in BUILD:
             ap.error("shadow needs morning|midday|evening")

@@ -16,7 +16,7 @@ questlog-weekly-reset.
 - `report.py`: builds the morning / midday / evening cards straight from the Notion API, without Claude
   (see "Local runner" below).
 - `make_sounds.py` → `sounds/*.wav`: original synthesized menu sounds (open, move, scroll, select,
-  done, undo, cancel, track, untrack, close). Edit and re-run to change them; `"sound": ""` in the card JSON mutes the card.
+  done, undo, cancel, track, untrack, close, alert). Edit and re-run to change them; `"sound": ""` in the card JSON mutes the card.
   Your own files in `sounds/custom/` (same names, .wav/.aiff/.caf/.m4a/.mp3) replace the built-in ones.
 
 ## When the Mac was asleep, off or away (catch-up) and the button
@@ -46,11 +46,36 @@ questlog-weekly-reset.
 - **The "!" badge:** `runs/urgent.json` = `{"items": [{"title", "due" (ISO date-time or YYYY-MM-DD), "url"}]}` puts an
   orange "!" on the icon: amber under 24 h, orange under 3 h, red and blinking under 1 h or overdue (the ring turns coral);
   the right-click menu lists those quests with a countdown and opens them. Levels come from the clock, so they work offline.
-  Nothing writes that file yet (it needs a "Due" property on the Quests database).
-- Files: `qlstate.py` (windows, stamps, claim locks, saved cards, mode), `QuestBar.swift` → `questbar`
+  Filled from the Quests "Due" property (see "Deadlines" below).
+- Files: `urgent.py` (deadlines and their escalation ladder), `qlstate.py` (windows, stamps, claim locks, saved cards, mode), `QuestBar.swift` → `questbar`
   (`swiftc -O QuestBar.swift -o questbar -framework Cocoa -framework Carbon`), logs in `runs/`.
   `report.py install` loads: the three daily agents, `com.questlog.catchup`, `com.questlog.bar`; `uninstall` removes them.
   A true desktop widget (WidgetKit) would need a signed app extension built in Xcode; the menu-bar button covers the same use.
+
+## Deadlines
+
+Give a quest a **Due** (date + time) in Notion (a date without a time means 23:59). Open quests that have one appear in the
+board view **⏰ Deadlines**, on the cards as a "Due Today 17:00" tag, on the menu-bar icon as the "!" badge, and they climb a ladder
+of urgent cards (`urgent.py`):
+
+| time left | what happens |
+|---|---|
+| 3 h | amber/orange badge, one silent compact card |
+| 1 h | red blinking badge, card with the open sound |
+| 15 min | card with the alert sound, again every 10 min until you act |
+| overdue | card with the alert sound, again every 30 min (stops 3 days after the deadline) |
+
+The urgent card is red, compact, with **Start** (T, tracks the quest), **Done** (D), **Snooze** (S, 15 minutes) and Details / Close.
+Rules: each step shows once; a quest you track (🔥 Grinding) keeps the steps but loses the repeats; a quest you clear on a card
+disappears at once; alerts wait until you are at the Mac, and only the 15-minute and overdue steps may replace a card that is open;
+the routine time windows do not apply. Several deadlines in one step come as one card.
+
+Where the list comes from (`runs/urgent.json`): `report.py refresh` (the catch-up agent runs it every 10 minutes, and every card the
+local runner builds refreshes it) needs the Notion token; without the token the three daily Claude tasks fill it through
+`urgent.py set` (step U of their prompts), so a deadline added at 14:00 is only noticed at the next daily card. `questbar` runs
+`report.py urgent` every minute while a deadline is within 3 hours (the catch-up agent also does, every 10 minutes).
+Commands: `python3 urgent.py list | tick [--force] [--dry-run] | snooze [MIN] | set (JSON on stdin) | clear`.
+Preview the card: `card.html?kind=urgent`.
 
 ## Full screen (default)
 
@@ -138,7 +163,7 @@ Known differences from the Claude tasks:
 
 | field | type | notes |
 |---|---|---|
-| kind | "morning" \| "midday" \| "evening" \| "weekly" | colour theme and header icon |
+| kind | "morning" \| "midday" \| "evening" \| "weekly" \| "urgent" | colour theme and header icon (urgent = the deadline card: compact only, with Start / Done / Snooze) |
 | badge | emoji | unused by the TOTK design (icon comes from kind) |
 | eyebrow | string | small line above the title |
 | title | string | |

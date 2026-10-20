@@ -67,6 +67,7 @@ final class Bar: NSObject, NSApplicationDelegate {
     var hotKey: EventHotKeyRef?
     var running: [Process] = []
     var lastCatchUp = Date.distantPast
+    var lastUrgentTick = Date.distantPast
     var lastOpen = Date.distantPast
     var urgent: [Urgent] = []      // soonest deadline first
     var pulse = true               // the red "!" blinks
@@ -86,7 +87,10 @@ final class Bar: NSObject, NSApplicationDelegate {
         }
         buildMenu()
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.refresh() }
+        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            self?.refresh()
+            self?.urgentTick()
+        }
         pulseTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
             guard let self = self, (self.urgent.first?.level() ?? 0) >= 3 else { return }
             self.pulse.toggle()
@@ -224,7 +228,8 @@ final class Bar: NSObject, NSApplicationDelegate {
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let list = obj["items"] as? [[String: Any]] {
             for e in list {
-                guard let title = e["title"] as? String, let raw = e["due"] as? String, let due = parseDue(raw) else { continue }
+                guard let title = e["title"] as? String, let raw = e["due"] as? String, let due = parseDue(raw),
+                      due.timeIntervalSinceNow > -3 * 86400 else { continue }
                 items.append(Urgent(title: title, due: due, url: e["url"] as? String))
             }
         }
@@ -301,6 +306,22 @@ final class Bar: NSObject, NSApplicationDelegate {
         } catch {
             NSSound.beep()
         }
+    }
+
+    /// A deadline is within 3 hours (or passed): once a minute ask `report.py urgent` whether a step of the escalation ladder
+    /// is due (it checks that you are at the Mac and shows the urgent card). Nothing runs while no deadline is near.
+    func urgentTick() {
+        guard Date().timeIntervalSince(lastUrgentTick) >= 55,
+              urgent.contains(where: { $0.due.timeIntervalSinceNow <= 3 * 3600 }) else { return }
+        lastUrgentTick = Date()
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: python)
+        p.arguments = [reportPy, "urgent"]
+        p.environment = ["PYTHONIOENCODING": "utf-8", "LANG": "en_US.UTF-8", "HOME": NSHomeDirectory(), "PATH": "/usr/bin:/bin"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = logHandle()
+        p.terminationHandler = { _ in DispatchQueue.main.async { [weak self] in self?.refresh() } }
+        try? p.run()
     }
 
     /// `report.py catchup` a few seconds after a wake-up or an unlock: it shows the card that is due and unseen, and only

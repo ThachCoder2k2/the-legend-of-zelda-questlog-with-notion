@@ -14,6 +14,7 @@ for opening/closing, and very short high blips for the cursor.
   track   a quest is tracked: rising lock-on blips
   untrack tracking removed: falling blip
   close   card closes: falling sweep + descending blips
+  alert   urgent deadline card: three insistent rising bells
 
 Run: python3 make_sounds.py   (pure Python, no dependencies)
 """
@@ -205,6 +206,14 @@ def make_close():
     finish(reverb(b, 0.2), "close", 0.45)
 
 
+def make_alert():
+    b = silence(1.0)
+    for t, f in ((0.0, 1760.0), (0.16, 1760.0), (0.32, 2349.3)):
+        tone(b, t, f, 0.6, 0.42, tau=0.16, partials=BELL[:3], detune=1.5)
+    tone(b, 0.0, 440, 0.45, 0.2, attack=0.006, tau=0.1, partials=[(1, 1), (2, 0.3)])
+    finish(reverb(b, 0.22), "alert", 0.7)
+
+
 if __name__ == "__main__":
-    for make in (make_open, make_move, make_scroll, make_select, make_done, make_undo, make_cancel, make_track, make_untrack, make_close):
+    for make in (make_open, make_move, make_scroll, make_select, make_done, make_undo, make_cancel, make_track, make_untrack, make_close, make_alert):
         make()

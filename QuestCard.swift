@@ -120,7 +120,7 @@ final class CardController: NSObject, NSApplicationDelegate, WKScriptMessageHand
         let dir = htmlURL.deletingLastPathComponent().appendingPathComponent("sounds")
         let custom = dir.appendingPathComponent("custom")
         let fm = FileManager.default
-        for (name, copies) in [("open", 1), ("move", 4), ("scroll", 4), ("select", 2), ("done", 2), ("undo", 2), ("cancel", 2), ("track", 2), ("untrack", 2), ("close", 1)] {
+        for (name, copies) in [("open", 1), ("move", 4), ("scroll", 4), ("select", 2), ("done", 2), ("undo", 2), ("cancel", 2), ("track", 2), ("untrack", 2), ("close", 1), ("alert", 1)] {
             let mine = ["wav", "aiff", "aif", "caf", "m4a", "mp3"].map { custom.appendingPathComponent(name + "." + $0) }
                 .first { fm.fileExists(atPath: $0.path) }
             let url = mine ?? dir.appendingPathComponent(name + ".wav")
@@ -542,6 +542,16 @@ final class CardController: NSObject, NSApplicationDelegate, WKScriptMessageHand
                           title: body["title"] as? String ?? "", revert: body["revert"] as? Bool ?? false)
         case "sfx":
             if let name = body["name"] as? String, sfx[name] != nil { play(name) }
+        case "snooze":   // the urgent card: hold the deadline alerts (urgent.py keeps the snooze), then close
+            guard !closing else { return }
+            let minutes = min(max((body["minutes"] as? NSNumber)?.intValue ?? 15, 1), 240)
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            p.arguments = [htmlURL.deletingLastPathComponent().appendingPathComponent("urgent.py").path, "snooze", String(minutes)]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            if (try? p.run()) != nil { p.waitUntilExit() }
+            dismiss()
         case "close":
             dismiss()
         default:

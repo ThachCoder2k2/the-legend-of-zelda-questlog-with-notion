@@ -15,7 +15,7 @@ Python 3.9+ standard library only.
                                      minute while a deadline is within 3 h; the catch-up agent every 10 minutes)
   python3 urgent.py snooze [MIN]     hold the alerts for MIN minutes (default 15); the card's Snooze button runs this
   python3 urgent.py clear            empty the list
-  python3 urgent.py push setup|sample|status|enable|disable|test
+  python3 urgent.py push setup|newtopic|sample|status|enable|disable|test
                                      phone push through ntfy.sh while you are away from the Mac (off until `enable`)
 
 Phone push (push.json, next to this file; never in git): while you are away from the Mac (no input for 10 minutes, or the screen
@@ -340,6 +340,14 @@ def push_away(alerts, state, now):
     return True
 
 
+def new_topic():
+    """questlog-xxxx-xxxx-xxxx-xxxx: 16 random lowercase letters and digits without look-alikes (no l, o, i, 0, 1), easy to type
+    on a phone and still about 79 bits of randomness."""
+    alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+    chars = "".join(secrets.choice(alphabet) for _ in range(16))
+    return "questlog-" + "-".join(chars[i:i + 4] for i in range(0, 16, 4))
+
+
 def push_cmd(args):
     sub = args[0] if args else "status"
     cfg = None
@@ -352,7 +360,7 @@ def push_cmd(args):
         if cfg and cfg.get("topic"):
             print("push.json already has a topic; use `push status`.")
             return 0
-        topic = "questlog-" + re.sub(r"[^A-Za-z0-9]", "", secrets.token_urlsafe(24))[:24]
+        topic = new_topic()
         cfg = {"enabled": False, "topic": topic, "server": "https://ntfy.sh", "titles": True}
         qlstate._write_atomic(PUSH_FILE, json.dumps(cfg, indent=1))
         os.chmod(PUSH_FILE, 0o600)
@@ -361,6 +369,12 @@ def push_cmd(args):
     if not cfg or not cfg.get("topic"):
         print("run `urgent.py push setup` first", file=sys.stderr)
         return 2
+    if sub == "newtopic":   # a fresh topic (the old one stops working for you); keeps on/off and the other settings
+        cfg["topic"] = new_topic()
+        qlstate._write_atomic(PUSH_FILE, json.dumps(cfg, indent=1))
+        os.chmod(PUSH_FILE, 0o600)
+        print("topic: " + cfg["topic"])
+        return 0
     if sub == "status":
         print(f"{'ON' if cfg.get('enabled') else 'OFF'} · server {cfg.get('server', 'https://ntfy.sh')} · topic {cfg['topic']} · "
               f"quest titles {'included' if cfg.get('titles', True) else 'left out'}")
@@ -383,7 +397,7 @@ def push_cmd(args):
                        {"topic": cfg["topic"], "title": "Quest Log · test", "message": "Phone push works.", "tags": ["white_check_mark"]})
         print("sent" if ok else "not sent")
         return 0 if ok else 1
-    print("usage: urgent.py push setup|sample|status|enable|disable|test", file=sys.stderr)
+    print("usage: urgent.py push setup|newtopic|sample|status|enable|disable|test", file=sys.stderr)
     return 2
 
 

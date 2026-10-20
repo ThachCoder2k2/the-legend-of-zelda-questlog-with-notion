@@ -43,6 +43,11 @@ questlog-weekly-reset.
   "Saved 22:11". Right-click: Morning / Midday / Evening / Weekly (last one) / the board / Quit. Every card ever shown is
   saved in `runs/last-KIND.json`, so the button also works offline. A manual open never marks a slot as shown, except when it opens a card that was due and unseen:
   then that card counts as shown. `report.py KIND --today DATE` (a preview of another day) saves nothing.
+- **Status actions in the menu:** right-click lists today's open quests (from `runs/today.json`, which every card you are shown
+  refreshes: the morning / midday list, or the evening card's plan for tomorrow). Each has a submenu: ✓ Clear · ▶ Track (start
+  now; one tracked quest at a time) · → Move to tomorrow · Open in Notion; the tracked quest sits on top with ■ Stop tracking.
+  A choice is queued in `pending.json` exactly like a card click and, when the token is saved, written to Notion at once
+  (`report.py apply`); without a token the next scheduled Claude task applies it. Cleared and moved quests leave the list.
 - **Tracking timer:** the quest you hit Track on (🔥 Grinding) shows as "▶ 12m" next to the icon (the tooltip and the menu's top item
   name it; the menu item opens it in Notion). It reads this Mac's card clicks (`pending.json`, `applied.json`) and drops out when you
   clear, untrack or move the quest, or after 10 hours.

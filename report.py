@@ -29,6 +29,7 @@ Notion"). Python 3.9+ standard library only.
                                        or the local runner is live and shows it)
   python3 report.py status             mode, token, which cards were shown today, the saved cards
   python3 report.py refresh            read the quests that have a Due date into runs/urgent.json (needs the token)
+  python3 report.py apply              write the queued card clicks to Notion now (the menu bar's status actions run it)
   python3 report.py add -- "TITLE, WHEN"  create a deadline quest in Notion (the menu bar's "Add deadline…"); WHEN reads
                                        "tomorrow 9am", "fri 17:00", "in 3h", "26/10 10:30" (quickadd.py); --dry-run only parses
   python3 report.py urgent [tick|list|snooze MIN|clear] [--force] [--dry-run]
@@ -359,6 +360,22 @@ def add_cmd(rest, args):
         log(f"add: deadline list not updated: {e!r}")
     log(f"add: {title!r} due {props['Due']['date']['start']}")
     print(f"Added: {title} · due {shown}")
+    return 0
+
+
+def apply_cmd():
+    """`report.py apply`: write the queued card clicks to Notion now (the menu-bar button runs it right after you change a
+    quest's status there). Quiet and exit 0 without a token; Notion errors stay in the queue for the next card."""
+    token = read_token()
+    if not token:
+        return 0
+    global INTERACTIVE
+    INTERACTIVE = True
+    try:
+        apply_queue(token)
+    except Exception as e:  # noqa: BLE001
+        log(f"apply: {e!r}")
+        return 1
     return 0
 
 
@@ -1243,7 +1260,7 @@ def main(argv):
         return main_add(argv[2:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, usage=argparse.SUPPRESS)
     ap.add_argument("cmd", choices=["morning", "midday", "evening", "shadow", "compare", "install", "uninstall", "check",
-                                    "now", "catchup", "gate", "status", "refresh", "urgent"])
+                                    "now", "catchup", "gate", "status", "refresh", "urgent", "apply"])
     ap.add_argument("rest", nargs="*")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--today")
@@ -1270,6 +1287,8 @@ def main(argv):
         return status_cmd()
     if args.cmd == "refresh":
         return refresh_deadlines()
+    if args.cmd == "apply":
+        return apply_cmd()
     if args.cmd == "urgent":   # report.py urgent [tick|list|snooze MIN|clear] [--force] [--dry-run]
         extra = (["--force"] if args.force else []) + (["--dry-run"] if args.dry_run else [])
         return urgent.main(["urgent.py", *(args.rest or ["tick"]), *(extra if (args.rest or ["tick"])[0] == "tick" else [])])

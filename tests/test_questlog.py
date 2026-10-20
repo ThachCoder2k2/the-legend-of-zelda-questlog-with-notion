@@ -519,6 +519,38 @@ check("a report for yesterday (made after midnight) judges by yesterday's end: n
       all(W not in i.get("tags", []) for sec in ev_old["sections"] for i in sec["items"]))
 report._now = real_now
 
+print("== today.json: the quest lists the menu-bar button acts on")
+reset()
+def tcard(kind, sections): return {"kind": kind, "title": "t", "sections": sections}
+U = "https://app.notion.com/p/"
+def titem(i, title, typ="main", status="📜 To Do", d=None):
+    return dict({"type": typ, "title": title, "url": U + f"{i:032x}", "status": status}, **({"date": d} if d else {}))
+qlstate.write_today(tcard("morning", [{"heading": "Today", "items": [titem(1, "A", "main", d="2026-10-20"), titem(2, "B", "fun", "✅ Cleared"), {"title": "no url"}]}]), date(2026, 10, 20))
+td = json.load(open(f"{RUNS}/today.json"))["days"]
+check("morning: the Today section, only items with a page url, date kept", [i["title"] for i in td["2026-10-20"]["items"]] == ["A", "B"] and td["2026-10-20"]["items"][0]["date"] == "2026-10-20" and td["2026-10-20"]["items"][0]["id"] == f"{1:032x}", td)
+qlstate.write_today(tcard("midday", [{"items": [titem(1, "A")]}]), date(2026, 10, 20))
+td = json.load(open(f"{RUNS}/today.json"))["days"]
+check("midday (a section without a heading) replaces that day's list", [i["title"] for i in td["2026-10-20"]["items"]] == ["A"] and td["2026-10-20"]["kind"] == "midday")
+qlstate.write_today(tcard("evening", [{"heading": "Today", "items": [titem(9, "Old")]}, {"heading": "Tomorrow · Wed 21/10", "items": [titem(3, "Plan")]}]), date(2026, 10, 20))
+td = json.load(open(f"{RUNS}/today.json"))["days"]
+check("evening: tomorrow's plan goes under tomorrow's date and today's list stays", [i["title"] for i in td["2026-10-21"]["items"]] == ["Plan"] and "2026-10-20" in td)
+qlstate.write_today(tcard("weekly", [{"heading": "Next week", "items": [titem(4, "W")]}]), date(2026, 10, 25))
+qlstate.write_today(tcard("morning", [{"heading": "Today", "items": [titem(5, "Later")]}]), date(2026, 10, 30))
+td = json.load(open(f"{RUNS}/today.json"))["days"]
+check("weekly cards are ignored; days older than two days are dropped", "2026-10-25" not in td and "2026-10-20" not in td and "2026-10-30" in td, list(td))
+reset(); n0 = len(shown())
+shown_ = report._show(tcard("morning", [{"heading": "Today", "items": [titem(7, "Via show_card")]}]), "--no-stamp"); time.sleep(0.5)
+check("a card shown through show_card.py writes today.json", os.path.exists(f"{RUNS}/today.json") and "Via show_card" in open(f"{RUNS}/today.json").read())
+reset(); report._show(tcard("morning", [{"heading": "Today", "items": [titem(7, "Offline copy")]}]), "--no-stamp", "--no-save"); time.sleep(0.5)
+check("a saved/offline card (--no-save) does not touch today.json", not os.path.exists(f"{RUNS}/today.json"))
+report.read_token = lambda: None
+check("report.py apply without a token: quiet, exit 0", report.apply_cmd() == 0)
+applied_with = []
+report.read_token = lambda: "secret"; real_apply = report.apply_queue
+report.apply_queue = lambda token: applied_with.append(token)
+check("report.py apply with a token writes the queue", report.apply_cmd() == 0 and applied_with == ["secret"])
+report.apply_queue = real_apply
+
 print("== ledger keeps the title (the bar's tracking timer reads it)")
 import subprocess as sp, tempfile, shutil
 tmp = tempfile.mkdtemp(); shutil.copy(SANDBOX + "/pending.py", tmp)

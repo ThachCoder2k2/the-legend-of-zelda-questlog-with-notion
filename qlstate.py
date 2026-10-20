@@ -265,6 +265,40 @@ def write_status(card, T=None):
         "updatedAt": now_local().astimezone().isoformat(timespec="seconds")}))
 
 
+def write_today(card, T):
+    """The quests of the card just shown, for the menu-bar button's status actions (runs/today.json, by day):
+    morning / midday = the day's list (T), evening = tomorrow's plan (T + 1). Only items that carry a Notion page url."""
+    kind = card.get("kind")
+    sections = card.get("sections") or []
+    if kind in ("morning", "midday"):
+        sec = next((s for s in sections if s.get("heading") in (None, "", "Today")), None)
+        target = T
+    elif kind == "evening":
+        sec = next((s for s in sections if str(s.get("heading") or "").startswith("Tomorrow")), None)
+        target = T + timedelta(days=1)
+    else:
+        return
+    items = []
+    for it in (sec or {}).get("items") or []:
+        m = re.search(r"[0-9a-f]{32}", str(it.get("url") or "").replace("-", ""))
+        if not m or not it.get("title"):
+            continue
+        e = {"id": m.group(0), "title": str(it["title"]), "type": it.get("type") or "side", "status": it.get("status") or "📜 To Do"}
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(it.get("date") or "")):
+            e["date"] = it["date"]
+        items.append(e)
+    path = os.path.join(RUNS, "today.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            days = (json.load(f).get("days") or {})
+    except (OSError, ValueError, AttributeError):
+        days = {}
+    keep_from = str(date.fromisoformat(str(T)) - timedelta(days=2))
+    days = {d: v for d, v in days.items() if d >= keep_from}
+    days[str(target)] = {"kind": kind, "items": items, "updatedAt": now_local().astimezone().isoformat(timespec="seconds")}
+    _write_atomic(path, json.dumps({"days": days}, ensure_ascii=False, indent=1))
+
+
 def read_status():
     try:
         with open(os.path.join(RUNS, "status.json"), encoding="utf-8") as f:

@@ -58,6 +58,10 @@ def remember(card):
             qlstate.save_last(card, source)
         except Exception as e:  # noqa: BLE001
             print("card not saved:", e, file=sys.stderr)
+        try:
+            qlstate.write_today(card, T or qlstate.now_local().date())
+        except Exception as e:  # noqa: BLE001
+            print("today list not written:", e, file=sys.stderr)
         if T is not None:
             try:
                 qlstate.write_status(card, T)

@@ -3,6 +3,9 @@
 //   click          open the Quest Log card for the time of day (live from Notion, or the last saved card offline)
 //   right-click    menu: urgent deadlines, Add deadline…, Morning / Midday / Evening / Weekly, the Notion board, Quit
 //   ⌃⌥Q            the same as a click, from anywhere
+//   status actions the menu lists today's open quests (from runs/today.json, written whenever a card is shown); each has
+//                  Clear / Track / Move to tomorrow / Open. The change is queued in pending.json like a card click, and
+//                  `report.py apply` writes it to Notion right away when the token is saved.
 //   tracking       a quest you hit Track on (🔥 Grinding, from pending.json / applied.json) shows "▶ 12m" next to the icon
 //   ⌃⌥D            Add deadline…: one line ("Submit visa form, tomorrow 9am") becomes a quest with a Due in Notion
 //
@@ -20,6 +23,8 @@ let folder = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.argu
     .resolvingSymlinksInPath().deletingLastPathComponent()
 let reportPy = folder.appendingPathComponent("report.py").path
 let statusFile = folder.appendingPathComponent("runs/status.json")
+let todayFile = folder.appendingPathComponent("runs/today.json")
+let queueFile = folder.appendingPathComponent("pending.json")
 let urgentFile = folder.appendingPathComponent("runs/urgent.json")
 let logFile = folder.appendingPathComponent("runs/bar.log")
 
@@ -74,8 +79,15 @@ struct Tracking {
     var elapsed: String { minutes < 60 ? "\(minutes)m" : "\(minutes / 60)h\(String(format: "%02d", minutes % 60))" }
 }
 
-func loadTracking() -> Tracking? {
-    var newest: [String: (at: Date, status: String)] = [:]
+/// The newest card click of each quest (queued in pending.json, or already written: applied.json), plus the titles seen.
+struct Click {
+    let at: Date
+    let status: String
+    let date: String?
+}
+
+func latestClicks() -> (clicks: [String: Click], titles: [String: String]) {
+    var newest: [String: Click] = [:]
     var titles: [String: String] = [:]
     for (file, key) in [("applied.json", "applied"), ("pending.json", "actions")] {
         guard let data = try? Data(contentsOf: folder.appendingPathComponent(file)),
@@ -85,12 +97,61 @@ func loadTracking() -> Tracking? {
             guard let id = e["id"] as? String, let status = e["status"] as? String,
                   let raw = e["at"] as? String, let at = parseDue(raw) else { continue }
             if let t = e["title"] as? String, !t.isEmpty { titles[id] = t }
-            if newest[id] == nil || at > newest[id]!.at { newest[id] = (at, status) }
+            if newest[id] == nil || at > newest[id]!.at { newest[id] = Click(at: at, status: status, date: e["date"] as? String) }
         }
     }
+    return (newest, titles)
+}
+
+func loadTracking() -> Tracking? {
+    let (newest, titles) = latestClicks()
     let live = newest.filter { $0.value.status == "🔥 Grinding" && $0.value.at.timeIntervalSinceNow > -10 * 3600 }
     guard let top = live.max(by: { $0.value.at < $1.value.at }) else { return nil }
     return Tracking(id: top.key, title: titles[top.key] ?? "a quest", since: top.value.at)
+}
+
+/// One open quest of today, as the last shown card listed it, with your newer clicks applied.
+struct TodayItem {
+    let id: String
+    let title: String
+    let type: String
+    let status: String
+    let date: String?
+}
+
+func loadToday(todayKey: String) -> [TodayItem] {
+    guard let data = try? Data(contentsOf: todayFile),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let days = obj["days"] as? [String: Any],
+          let day = days[todayKey] as? [String: Any],
+          let list = day["items"] as? [[String: Any]] else { return [] }
+    let (clicks, _) = latestClicks()
+    var out: [TodayItem] = []
+    for e in list {
+        guard let id = e["id"] as? String, let title = e["title"] as? String else { continue }
+        var status = e["status"] as? String ?? "📜 To Do"
+        var date = e["date"] as? String
+        if let c = clicks[id] {   // a newer click wins over what the card said
+            status = c.status
+            if let d = c.date { date = d }
+        }
+        if status == "✅ Cleared" { continue }
+        if let d = date, d > todayKey { continue }   // moved to a later day
+        out.append(TodayItem(id: id, title: title, type: e["type"] as? String ?? "side", status: status, date: date))
+    }
+    return out
+}
+
+/// What a status action in the menu does: the new Status (and, for a move, the new Date) of one quest.
+final class QuestAction: NSObject {
+    let id: String
+    let title: String
+    let status: String
+    let date: String?
+    let flash: String
+    init(id: String, title: String, status: String, date: String? = nil, flash: String) {
+        self.id = id; self.title = title; self.status = status; self.date = date; self.flash = flash
+    }
 }
 
 final class Bar: NSObject, NSApplicationDelegate {
@@ -107,6 +168,7 @@ final class Bar: NSObject, NSApplicationDelegate {
     var addHotKey: EventHotKeyRef?
     var addOpen = false            // the Add deadline box is on screen
     var tracking: Tracking?        // the quest being tracked, if any
+    var todayItems: [TodayItem] = []   // today's open quests (menu)
     var retryText = ""              // what was typed when the line wasn't understood: put back in the box
     var tooltipNote = ""            // what the last add said, until the next refresh of the tooltip
     var lastOpen = Date.distantPast
@@ -210,10 +272,22 @@ final class Bar: NSObject, NSApplicationDelegate {
         }
         if urgent.contains(where: { $0.level() > 0 }) { menu.addItem(.separator()) }
         if let t = tracking {
-            let m = NSMenuItem(title: "▶  Tracking: \(t.title) · \(t.elapsed)", action: #selector(openUrgent(_:)), keyEquivalent: "")
-            m.target = self
-            m.representedObject = "https://app.notion.com/p/" + t.id
+            let m = NSMenuItem(title: "▶  Tracking: \(shorten(t.title)) · \(t.elapsed)", action: nil, keyEquivalent: "")
+            m.submenu = questMenu(id: t.id, title: t.title, tracked: true, date: nil)
             menu.addItem(m)
+        }
+        let others = todayItems.filter { $0.id != tracking?.id }
+        if !others.isEmpty || tracking != nil { menu.addItem(.separator()) }
+        if !others.isEmpty {
+            let head = NSMenuItem(title: "Today's quests", action: nil, keyEquivalent: "")
+            head.isEnabled = false
+            menu.addItem(head)
+            for q in others.prefix(8) {
+                let icon = q.type == "main" ? "⭐" : q.type == "fun" ? "🎮" : "🧩"
+                let m = NSMenuItem(title: "\(icon)  \(shorten(q.title))", action: nil, keyEquivalent: "")
+                m.submenu = questMenu(id: q.id, title: q.title, tracked: false, date: q.date)
+                menu.addItem(m)
+            }
             menu.addItem(.separator())
         }
         if !notionOK {
@@ -261,6 +335,7 @@ final class Bar: NSObject, NSApplicationDelegate {
             tip = "Quest Log: \(done) of \(total) quests cleared\(asOf) · click to open"
         }
         tracking = loadTracking()
+        todayItems = loadToday(todayKey: todayString())
         if let t = tracking {
             text = " ▶ " + t.elapsed
             tip = "Tracking: \(t.title) · \(t.elapsed) · click to open the card"
@@ -281,7 +356,7 @@ final class Bar: NSObject, NSApplicationDelegate {
             let more = urgent.filter { $0.level() > 0 }.count - 1
             tip = "! \(first.title): \(first.countdown())" + (more > 0 ? " (+\(more) more)" : "") + " · click to open"
         }
-        let key = "\(text == " ✓")-\(worst)-\(worst >= 3 ? pulse : true)-\(notionOK)-\(tracking?.id ?? "")"
+        let key = "\(text == " ✓")-\(worst)-\(worst >= 3 ? pulse : true)-\(notionOK)-\(tracking?.id ?? "")-\(todayItems.map { $0.id }.joined())"
         if key != lastIconKey {   // redraw only when something changed
             lastIconKey = key
             item.button?.image = icon(done: text == " ✓", level: worst, pulse: pulse)
@@ -306,6 +381,92 @@ final class Bar: NSObject, NSApplicationDelegate {
             }
         }
         urgent = items.sorted { $0.due < $1.due }
+    }
+
+    func shorten(_ text: String) -> String { text.count > 44 ? String(text.prefix(43)) + "…" : text }
+
+    /// The actions of one quest: Clear, Track / Stop tracking, Move to tomorrow, Open in Notion.
+    func questMenu(id: String, title: String, tracked: Bool, date: String?) -> NSMenu {
+        let sub = NSMenu()
+        func add(_ label: String, _ action: QuestAction) {
+            let m = NSMenuItem(title: label, action: #selector(applyQuest(_:)), keyEquivalent: "")
+            m.target = self
+            m.representedObject = action
+            sub.addItem(m)
+        }
+        add("✓  Clear", QuestAction(id: id, title: title, status: "✅ Cleared", flash: "✓ cleared"))
+        if tracked {
+            add("■  Stop tracking", QuestAction(id: id, title: title, status: "📜 To Do", flash: "■ stopped"))
+        } else {
+            add("▶  Track (start now)", QuestAction(id: id, title: title, status: "🔥 Grinding", flash: "▶ tracking"))
+        }
+        let tomorrow = dayAfter(max(todayString(), date ?? ""))
+        add("→  Move to tomorrow", QuestAction(id: id, title: title, status: "📜 To Do", date: tomorrow, flash: "→ moved"))
+        sub.addItem(.separator())
+        let open = NSMenuItem(title: "Open in Notion", action: #selector(openUrgent(_:)), keyEquivalent: "")
+        open.target = self
+        open.representedObject = "https://app.notion.com/p/" + id
+        sub.addItem(open)
+        return sub
+    }
+
+    /// "2026-10-20" -> "2026-10-21", Gregorian and POSIX whatever the region settings.
+    func dayAfter(_ day: String) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = Calendar(identifier: .gregorian)
+        f.dateFormat = "yyyy-MM-dd"
+        guard let d = f.date(from: day), let next = Calendar(identifier: .gregorian).date(byAdding: .day, value: 1, to: d) else { return day }
+        return f.string(from: next)
+    }
+
+    /// A status action from the menu: queue it like a card click, then write the queue to Notion if a token is saved.
+    @objc func applyQuest(_ sender: NSMenuItem) {
+        guard let a = sender.representedObject as? QuestAction else { return }
+        var changes = [a]
+        if a.status == "🔥 Grinding", let t = tracking, t.id != a.id {   // one tracked quest at a time, like the card
+            changes.insert(QuestAction(id: t.id, title: t.title, status: "📜 To Do", flash: ""), at: 0)
+        }
+        var actions: [[String: Any]] = []
+        if let data = try? Data(contentsOf: queueFile),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            actions = (obj["actions"] as? [[String: Any]]) ?? []
+        }
+        let stamper = ISO8601DateFormatter()
+        stamper.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        for c in changes {
+            actions.removeAll { ($0["id"] as? String) == c.id }   // a newer click supersedes an older queued one
+            var e: [String: Any] = ["id": c.id, "status": c.status, "title": c.title, "at": stamper.string(from: Date())]
+            if let d = c.date { e["date"] = d }
+            actions.append(e)
+        }
+        guard let out = try? JSONSerialization.data(withJSONObject: ["version": 1, "actions": actions], options: [.prettyPrinted]) else {
+            NSSound.beep()
+            return
+        }
+        do {
+            try out.write(to: queueFile, options: .atomic)
+        } catch {
+            NSSound.beep()
+            return
+        }
+        flash = (a.flash, Date().addingTimeInterval(3))
+        tooltipNote = ""
+        lastIconKey = ""
+        refresh()
+        if notionOK { runPython(["apply"]) }
+    }
+
+    /// `report.py <args>` in the background; the icon refreshes when it ends.
+    func runPython(_ args: [String]) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: python)
+        p.arguments = [reportPy] + args
+        p.environment = ["PYTHONIOENCODING": "utf-8", "LANG": "en_US.UTF-8", "HOME": NSHomeDirectory(), "PATH": "/usr/bin:/bin"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = logHandle()
+        p.terminationHandler = { _ in DispatchQueue.main.async { [weak self] in self?.refresh() } }
+        try? p.run()
     }
 
     /// Is a Notion token saved (and not empty: an empty paste leaves an empty Keychain item)? Asks `security`, at most once a
@@ -458,6 +619,8 @@ final class Bar: NSObject, NSApplicationDelegate {
         let type = NSApp.currentEvent?.type
         let flags = NSApp.currentEvent?.modifierFlags ?? []
         if type == .rightMouseUp || flags.contains(.control) {
+            tracking = loadTracking()
+            todayItems = loadToday(todayKey: todayString())
             buildMenu()   // fresh countdowns
             item.menu = menu
             item.button?.performClick(nil)   // shows the menu under the icon

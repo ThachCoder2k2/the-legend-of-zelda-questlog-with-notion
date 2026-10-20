@@ -91,6 +91,11 @@ def log(msg):
     print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}", file=sys.stderr, flush=True)
 
 
+def _now():
+    """The local time as an aware datetime (one place, so the tests can set the clock)."""
+    return datetime.now().astimezone()
+
+
 def label(d):
     return f"{DAYS[d.weekday()]} {d:%d/%m}"
 
@@ -612,9 +617,19 @@ def build_evening(data, T, ledger):
     plan.sort(key=lambda r: RANK.get(r["type"], 3))
     carried = {r["id"] for r in unfinished}
 
+    cutoff = min(_now(), datetime(T.year, T.month, T.day, 23, 59).astimezone())   # a report for an earlier day judges by its end
+
+    def past_due(r):
+        d = urgent.parse_due(r.get("due"))
+        return bool(d) and r["status"] != CLEARED and d <= cutoff
+
     def today_tags(r):
         return ((["→ rolls to tomorrow"] if r["id"] in carried else []) + (["⏸ delayed to tomorrow"] if r["status"] == DELAY else [])
-                + ([f"→ moved to {label(moved[r['id']])}"] if r["id"] in moved else []))
+                + ([f"→ moved to {label(moved[r['id']])}"] if r["id"] in moved else [])
+                + (["⚠ past its deadline"] if past_due(r) else []))
+
+    def plan_tags(r):
+        return (["↩︎"] if r["id"] in carried else []) + (["⚠ past its deadline"] if past_due(r) else [])
 
     m, f = sum(r["type"] == MAIN for r in plan), sum(r["type"] == FUN for r in plan)
     card = {
@@ -630,7 +645,7 @@ def build_evening(data, T, ledger):
                      {"icon": "🔥", "value": str(streak), "label": "day streak"}]
     card["sections"] = [
         {"heading": "Today", "items": [item(r, data, pool, today_tags(r), done=r["status"] == CLEARED) for r in today]},
-        {"heading": f"Tomorrow · {label(TM)}", "items": [item(r, data, pool, ["↩︎"] if r["id"] in carried else None) for r in plan],
+        {"heading": f"Tomorrow · {label(TM)}", "items": [item(r, data, pool, plan_tags(r)) for r in plan],
          "empty": "Nothing yet. Open the board and plan 1 ⭐ for tomorrow."},
     ]
     first_main = next((r for r in plan if r["type"] == MAIN), None)

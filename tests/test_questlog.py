@@ -499,6 +499,26 @@ ev2 = report.build_evening({"rows": [dict(r, date="2026-10-20") if r["id"] == f"
 check("an Undo (newer entry) cancels the move", st2 := {s["label"]: s["value"] for s in ev2["stats"]}["moved"] == "0", st2)
 
 
+print("== evening card: unfinished quests past their Due are flagged")
+late_rows = [dict(row(1, "Report", MAINQ, "📜 To Do", "2026-10-20"), due="2026-10-20T17:00:00+07:00"),
+             dict(row(2, "Rent", SIDEQ, "📜 To Do", "2026-10-20"), due="2026-10-20T23:30:00+07:00"),
+             dict(row(3, "Done one", SIDEQ, "✅ Cleared", "2026-10-20", "2026-10-20T04:00:00Z"), due="2026-10-20T09:00:00+07:00"),
+             dict(row(4, "Tomorrow's", SIDEQ, "📜 To Do", "2026-10-21"), due="2026-10-20T12:00:00+07:00")]
+real_now = report._now
+report._now = lambda: datetime(2026, 10, 20, 22, 0).astimezone()
+evl = report.build_evening({"rows": late_rows, "questlines": {}}, date(2026, 10, 20), [])
+tags = {i["title"]: i.get("tags", []) for sec in evl["sections"] for i in sec["items"]}
+W = "⚠ past its deadline"
+check("22:00: a Due at 17:00 that is not done is flagged", W in tags["Report"], tags)
+check("22:00: a Due at 23:30 is not past yet", W not in tags["Rent"], tags)
+check("a cleared quest is never flagged", W not in tags["Done one"], tags)
+check("a quest in tomorrow's plan whose Due has passed is flagged too", W in tags["Tomorrow's"], tags)
+report._now = lambda: datetime(2026, 10, 21, 0, 30).astimezone()
+ev_old = report.build_evening({"rows": late_rows, "questlines": {}}, date(2026, 10, 19), [])
+check("a report for yesterday (made after midnight) judges by yesterday's end: nothing due on the 20th is past",
+      all(W not in i.get("tags", []) for sec in ev_old["sections"] for i in sec["items"]))
+report._now = real_now
+
 print("== ledger keeps the title (the bar's tracking timer reads it)")
 import subprocess as sp, tempfile, shutil
 tmp = tempfile.mkdtemp(); shutil.copy(SANDBOX + "/pending.py", tmp)

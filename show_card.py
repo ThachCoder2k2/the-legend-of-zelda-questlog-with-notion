@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """Show a Quest Log card on the Mac.
 
-Usage: python3 show_card.py card.json   (or pipe the JSON on stdin)
+Usage: python3 show_card.py [card.json] [--no-stamp] [--no-save] [--source NAME]
+       (the JSON can also be piped on stdin)
+
+Every card shown is also remembered (qlstate.py): runs/last-KIND.json is the offline fallback of the menu-bar
+button, runs/status.json feeds its progress badge, and a "shown" stamp tells the catch-up and the Claude tasks'
+late guard that this slot is done. --no-stamp (a manual open) leaves the stamp alone, --no-save (a cached card
+being shown again) leaves the cache alone.
 
 Opens the card (questcard + card.html, same folder). If that
 binary is missing, falls back to a plain AppleScript dialog so the reminder is
@@ -17,9 +23,36 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BOARD = "notion://www.notion.so/3fe207ad5a6f81858d5fcde429bff7cf"
 EMOJI = {"main": "⭐", "side": "🧩", "fun": "🎮"}
 
-data = json.load(open(sys.argv[1], encoding="utf-8")) if len(sys.argv) > 1 else json.load(sys.stdin)
+args = sys.argv[1:]
+flags = {a for a in args if a.startswith("--")}
+source = args[args.index("--source") + 1] if "--source" in args and args.index("--source") + 1 < len(args) else "claude-task"
+files = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] != "--source")]
+data = json.load(open(files[0], encoding="utf-8")) if files else json.load(sys.stdin)
 data.setdefault("timeoutSec", 1800)
 data.setdefault("url", BOARD)
+
+
+def remember(card):
+    """Bookkeeping must never stop a card from showing."""
+    try:
+        sys.path.insert(0, HERE)
+        sys.dont_write_bytecode = True
+        import qlstate
+        now = qlstate.now_local()
+        if "--no-save" not in flags:
+            qlstate.save_last(card, source)
+        kind = card.get("kind")
+        T = qlstate.scheduled_day(kind, now) if kind in qlstate.TIMES else None
+        if T is not None:
+            if "--no-save" not in flags:
+                qlstate.write_status(card, T)
+            if "--no-stamp" not in flags:
+                qlstate.mark(T, kind)
+    except Exception as e:  # noqa: BLE001
+        print("state not saved:", e, file=sys.stderr)
+
+
+remember(data)
 
 fd, path = tempfile.mkstemp(prefix="questlog-", suffix=".json")
 with os.fdopen(fd, "w", encoding="utf-8") as f:

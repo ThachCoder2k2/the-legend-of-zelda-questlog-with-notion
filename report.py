@@ -1,0 +1,1013 @@
+#!/usr/bin/env python3
+"""Quest Log morning / midday / evening cards built straight from the Notion API.
+
+Produces the same cards as the Claude scheduled tasks questlog-morning-report, questlog-evening-reminder (12:00)
+and questlog-evening-report (their SKILL.md prompts are the spec), in a second, with no Claude tokens and with
+the Claude app closed. Needs the Notion integration token in the login Keychain (README.md, "Saving done to
+Notion"). Python 3.9+ standard library only.
+
+  python3 report.py morning|midday|evening [options]
+        apply the queued card clicks (pending.json) to Notion, read the board, show the card
+    --dry-run              print the card JSON instead: no Notion writes, pending.json untouched, no card
+                           (queued clicks are applied in memory, so the JSON matches a real run)
+    --today YYYY-MM-DD     build the card for that day
+    --fixture FILE         read the board from FILE (written by --save-fixture) instead of Notion; implies --dry-run
+    --save-fixture FILE    also write what was read from Notion to FILE
+    --scheduled            launchd run: skip when the Mac woke up too late for this card, or it was already shown
+  python3 report.py shadow morning|midday|evening
+        LaunchAgent before go-live: shows nothing, waits for the Claude task's card (/tmp/questlog-KIND-card.json),
+        builds ours at that moment and logs the differences (runs/compare.log, runs/DATE-KIND.diff.txt)
+  python3 report.py compare KIND [CLAUDE.json [LOCAL.json]]
+        diff two cards (default: the Claude task's last card against a dry run now)
+  python3 report.py now [KIND]         open a card right now (the menu-bar button): the live card, or the last saved one
+                                       when Notion is unreachable. KIND defaults to the one for the time of day
+                                       (morning / midday / evening / weekly = the last weekly card)
+  python3 report.py catchup            LaunchAgent (at login and every 10 min): show the one card that is due and unseen
+                                       once you are back at the Mac (not while another card is open); live mode only
+  python3 report.py gate KIND          for the Claude tasks: "go DATE" or "skip: why" (outside the window, already shown,
+                                       or the local runner is live and shows it)
+  python3 report.py status             mode, token, which cards were shown today, the saved cards
+  python3 report.py install [--live]   write and load the LaunchAgents (07:30, 12:00, 22:00 + catch-up + menu-bar button);
+                                       shadow mode by default, --live makes the local runner show the cards
+  python3 report.py uninstall          unload and remove them
+  python3 report.py check              token, Notion access, row counts
+
+  Options for gate / catchup / now: --at "YYYY-MM-DD HH:MM" pretends it is that time (tests); catchup --dry-run only
+  says what it would do; catchup --force runs even in shadow mode.
+"""
+import argparse
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import date, datetime, timedelta, timezone
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+sys.dont_write_bytecode = True
+import pending  # noqa: E402  (pending.json / applied.json helpers next to this file)
+import qlstate  # noqa: E402  (windows, shown stamps, claim locks, last-card cache, mode)
+from qlstate import TIMES, WINDOW, scheduled_day  # noqa: E402,F401
+
+RUNS = os.path.join(HERE, "runs")
+SHOW = os.path.join(HERE, "show_card.py")
+PENDING = os.path.join(HERE, "pending.py")
+API = "https://api.notion.com/v1"
+NOTION_VERSION = "2022-06-28"
+QUESTS_DB = "3ed39b409ee7481398e1892238e0821a"      # 🗂️ Quest Log Data → Quests (collection://60fcffbd-0336-432e-bd7c-816b68e905a4)
+QUESTLINES_DB = "3e46ad718caa4e06a1830c528b6f96e6"  # 🗂️ Quest Log Data → Questlines (collection://126443f4-aef3-4330-96d7-5b529fd08d22)
+PAGE = "https://app.notion.com/p/"
+CLAUDE_CARD = "/tmp/questlog-{}-card.json"
+AGENT = "com.questlog.report."
+BAR = "com.questlog.bar"
+CATCHUP = "com.questlog.catchup"
+KEEP_DAYS = 30
+
+MAIN, SIDE, FUN = "⭐ Main Quest", "🧩 Side Quest", "🎮 Fun"
+TODO, DELAY, GRINDING, CLEARED = "📜 To Do", "⏸ Delay", "🔥 Grinding", "✅ Cleared"
+LOCKED = "🔒 Locked"
+TYPE = {MAIN: "main", SIDE: "side", FUN: "fun"}
+RANK = {MAIN: 0, SIDE: 1, FUN: 2}
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def log(msg):
+    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}", file=sys.stderr, flush=True)
+
+
+def label(d):
+    return f"{DAYS[d.weekday()]} {d:%d/%m}"
+
+
+def plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def day(s):
+    try:
+        return date.fromisoformat(str(s)[:10]) if s else None
+    except ValueError:
+        return None
+
+
+def parse_ts(v):
+    """Aware datetime from an ISO timestamp ("Z", offset, or naive = UTC); None if unparseable."""
+    s = str(v or "").replace("Z", "+00:00")
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?(.*)$", s)
+    if m:  # Python 3.9 only reads 3 or 6 fractional digits
+        s = m.group(1) + ((m.group(2) or "")[:7].ljust(7, "0") if m.group(2) else "") + m.group(3)
+    try:
+        t = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def local_day(v):
+    t = parse_ts(v)
+    return t.astimezone().date() if t else None
+
+
+# ---------------------------------------------------------------- 2-Min Start text
+
+COMMANDS = {"git", "npm", "npx", "pnpm", "yarn", "pip", "pip3", "python", "python3", "node", "brew", "make",
+            "docker", "curl", "ls", "cat", "grep", "head", "tail", "cd", "swiftc", "rg", "find", "chmod"}
+SUBCOMMANDS = {
+    "git": {"status", "diff", "add", "commit", "push", "pull", "log", "checkout", "switch", "branch", "stash",
+            "restore", "reset", "fetch", "merge", "rebase", "init", "clone", "show", "tag", "rm", "mv"},
+    "npm": {"run", "test", "install", "i", "ci", "start"}, "pnpm": {"run", "test", "install", "i", "dev", "build"},
+    "yarn": {"run", "test", "install", "add", "dev", "build"}, "pip": {"install", "list", "freeze", "show"},
+    "pip3": {"install", "list", "freeze", "show"}, "brew": {"install", "upgrade", "update", "list", "info"},
+    "docker": {"compose", "run", "ps", "build", "logs", "exec"},
+}
+
+
+def _core(tok):
+    core = tok.rstrip(".,;:!?")
+    return core, core != tok
+
+
+def _arglike(tok):
+    return bool(tok) and (tok[0] in "-./~$" or "/" in tok or "=" in tok or tok.isdigit()
+                          or re.search(r"\.\w{1,5}$", tok) is not None)
+
+
+def _command_end(toks, i, piped=False):
+    """Index of the last token of the shell command starting at toks[i], or None if it isn't one."""
+    name, stop = _core(toks[i][1])
+    if not piped and name not in COMMANDS:
+        return None
+    j, args = i, 0
+    if name in SUBCOMMANDS and not piped:
+        if stop or i + 1 >= len(toks) or _core(toks[i + 1][1])[0] not in SUBCOMMANDS[name]:
+            return None
+        j, args, stop = i + 1, 1, _core(toks[i + 1][1])[1]
+    while not stop and j + 1 < len(toks):
+        nxt, nstop = _core(toks[j + 1][1])
+        if nxt in ("|", "&&") and j + 2 < len(toks):
+            k = _command_end(toks, j + 2, piped=True)
+            if k is None:
+                break
+            return k
+        if not _arglike(nxt):
+            break
+        j, args, stop = j + 1, args + 1, nstop
+    return j if args or piped else None
+
+
+def wrap_shell(text):
+    """Wrap shell commands in backticks, the deterministic version of what the Claude tasks do by judgement:
+    'run git status --short | head -40.' -> 'run `git status --short | head -40`.'"""
+    if "`" in text:
+        return text
+    toks = [(m.start(), m.group()) for m in re.finditer(r"\S+", text)]
+    spans, i = [], 0
+    while i < len(toks):
+        j = _command_end(toks, i)
+        if j is None:
+            i += 1
+            continue
+        spans.append((toks[i][0], toks[j][0] + len(_core(toks[j][1])[0])))
+        i = j + 1
+    for a, b in reversed(spans):
+        text = text[:a] + "`" + text[a:b] + "`" + text[b:]
+    return text
+
+
+def start_text(s):
+    return wrap_shell((s or "").replace("\\|", "|").strip())
+
+
+# ---------------------------------------------------------------- Notion
+
+class NotionError(Exception):
+    def __init__(self, code, msg):
+        super().__init__(f"Notion {code}: {msg}" if code > 0 else str(msg))
+        self.code = code  # HTTP status, 0 = unreachable, -1 = no token
+
+
+def read_token():
+    """The integration token from the login Keychain (via /usr/bin/security, which owns the item: no prompt)."""
+    try:
+        r = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", "QuestLog Notion", "-a", "token", "-w"],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return (r.stdout.strip() or None) if r.returncode == 0 else None
+
+
+def notion(token, method, path, body=None, tries=4):
+    data = None if body is None else json.dumps(body).encode()
+    for n in range(tries):
+        req = urllib.request.Request(API + path, data=data, method=method, headers={
+            "Authorization": "Bearer " + token, "Notion-Version": NOTION_VERSION, "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            msg = e.read().decode("utf-8", "replace")
+            try:
+                msg = json.loads(msg).get("message", msg)
+            except (ValueError, AttributeError):
+                pass
+            if e.code not in (409, 429, 500, 502, 503, 504) or n == tries - 1:
+                raise NotionError(e.code, msg)
+            try:
+                wait = float(e.headers.get("Retry-After") or 2 ** n)
+            except ValueError:
+                wait = 2 ** n
+            time.sleep(min(wait, 30))
+        except (urllib.error.URLError, OSError) as e:
+            if n == tries - 1:
+                raise NotionError(0, f"Notion unreachable: {getattr(e, 'reason', e)}")
+            time.sleep(2 ** n)
+
+
+def query_all(token, db, body=None):
+    pages, cursor = [], None
+    while True:
+        b = dict(body or {}, page_size=100, **({"start_cursor": cursor} if cursor else {}))
+        r = notion(token, "POST", f"/databases/{db}/query", b)
+        pages += r.get("results", [])
+        cursor = r.get("next_cursor")
+        if not r.get("has_more") or not cursor:
+            return pages
+
+
+def plain(rich):
+    return "".join(t.get("plain_text", "") for t in rich or [])
+
+
+def quest_row(page):
+    p = page.get("properties", {})
+    get = lambda name, kind: (p.get(name) or {}).get(kind)  # noqa: E731
+    name = lambda v: (v or {}).get("name")  # noqa: E731
+    return {
+        "id": page["id"].replace("-", ""),
+        "title": plain(get("Quest", "title")),
+        "type": name(get("Type", "select")),
+        "status": name(get("Status", "status")),
+        "date": ((get("Date", "date") or {}).get("start") or "")[:10] or None,
+        "energy": name(get("Energy", "select")),
+        "start": plain(get("2-Min Start", "rich_text")),
+        "questlines": [r["id"].replace("-", "") for r in get("Questline", "relation") or []],
+        "edited": get("Edited", "last_edited_time") or page.get("last_edited_time"),
+        "on_today": (get("On Today", "formula") or {}).get("string"),
+    }
+
+
+def fetch(token):
+    """Every quest (the ⚔️ Today, 🗓️ This Week and 🪧 Quest Board views are filters of it) and the questlines."""
+    pages = query_all(token, QUESTS_DB, {"sorts": [{"property": "Type", "direction": "ascending"},
+                                                   {"property": "Date", "direction": "ascending"}]})
+    qls = {}
+    for pg in query_all(token, QUESTLINES_DB):
+        pr = pg.get("properties", {})
+        qls[pg["id"].replace("-", "")] = {"name": plain((pr.get("Questline") or {}).get("title")),
+                                          "goal": plain((pr.get("Done means") or {}).get("rich_text"))}
+    return {"read_at": datetime.now(timezone.utc).isoformat(), "on_today_date": date.today().isoformat(),
+            "rows": [quest_row(pg) for pg in pages], "questlines": qls}
+
+
+# ---------------------------------------------------------------- step 0: card clicks
+
+def queued():
+    return [a for a in pending.read_json(pending.QUEUE, "actions") if pending.valid(a)]
+
+
+def apply_queue(token):
+    """Write the queued card clicks to Notion (Status, plus Date for a move) and drop them via pending.py done."""
+    r = subprocess.run([sys.executable, PENDING, "list"], capture_output=True, text=True, timeout=30)
+    try:
+        actions = json.loads(r.stdout or "[]")
+    except ValueError:
+        log(f"pending.py list failed: {r.stderr.strip()}")
+        return
+    for a in actions:
+        if a.get("status") not in pending.ALLOWED:
+            continue
+        props = {"Status": {"status": {"name": a["status"]}}}
+        if a.get("date"):
+            props["Date"] = {"date": {"start": a["date"]}}
+        try:
+            notion(token, "PATCH", f"/pages/{a['id']}", {"properties": props})
+        except NotionError as e:
+            log(f"click on {a.get('title') or a['id']} stays queued: {e}")
+            continue
+        subprocess.run([sys.executable, PENDING, "done", a["id"], a.get("at", "")], capture_output=True, timeout=30)
+        log(f"applied click: {a.get('title') or a['id']} → {a['status']}" + (f" on {a['date']}" if a.get("date") else ""))
+
+
+def overlay(rows, actions, ledger):
+    """Dry run: what step 0 would change, in memory only."""
+    by_id = {r["id"]: r for r in rows}
+    now = datetime.now(timezone.utc).isoformat()
+    for a in actions:
+        if a["id"] in by_id:
+            by_id[a["id"]]["status"] = a["status"]
+            if a.get("date"):
+                by_id[a["id"]]["date"] = a["date"]
+        ledger.append(dict({"id": a["id"], "status": a["status"], "at": a.get("at", ""), "applied_at": now},
+                           **({"date": a["date"]} if a.get("date") else {})))
+
+
+# ---------------------------------------------------------------- views and items
+
+def titled(rows):
+    return [r for r in rows if (r["title"] or "").strip()]
+
+
+def week_rows(rows):  # 🗓️ This Week: every quest with a Date
+    return [r for r in rows if r["date"]]
+
+
+def board_rows(rows):  # 🪧 Quest Board: undated and not cleared
+    return [r for r in rows if not r["date"] and r["status"] != CLEARED]
+
+
+def today_rows(data, T):
+    """⚔️ Today = Notion's "On Today" formula; for another day (or without the formula) the prompts' fallback rule."""
+    rows = titled(data["rows"])
+    if data.get("on_today_date") == T.isoformat() and any(r.get("on_today") is not None for r in data["rows"]):
+        return [r for r in rows if r.get("on_today") == "yes"]
+    return [r for r in rows if r["date"] and (day(r["date"]) == T or (day(r["date"]) < T and r["status"] != CLEARED))]
+
+
+def steps(shown, qid, pool):
+    """The questline log: the shown quest, its unfinished steps (earliest first), then the latest cleared ones;
+    at most 8, listed by Date, undated last."""
+    members = [q for q in pool if qid in q["questlines"]]
+    order = {q["id"]: n for n, q in enumerate(pool)}
+    chosen, seen = [shown], {shown["id"]}
+
+    def add(qs):
+        for q in qs:
+            if len(chosen) < 8 and q["id"] not in seen:
+                chosen.append(q)
+                seen.add(q["id"])
+
+    add(sorted((q for q in members if q["status"] != CLEARED), key=lambda q: (q["date"] is None, q["date"] or "")))
+    cleared = [q for q in members if q["status"] == CLEARED]
+    add(sorted((q for q in cleared if q["date"]), key=lambda q: q["date"], reverse=True) + [q for q in cleared if not q["date"]])
+    chosen.sort(key=lambda q: (q["date"] is None, q["date"] or "", order.get(q["id"], -1)))
+    return [dict({"title": q["title"], "url": PAGE + q["id"]}, **({"date": q["date"]} if q["date"] else {}),
+                 done=q["status"] == CLEARED) for q in chosen]
+
+
+def item(r, data, pool, tags=None, **flags):
+    it = {"type": TYPE.get(r["type"], "side"), "title": r["title"]}
+    if tags:
+        it["tags"] = tags
+    it.update({k: True for k, v in flags.items() if v})
+    it["url"] = PAGE + r["id"]
+    it["status"] = r["status"]
+    if r["date"]:
+        it["date"] = r["date"]
+    if start_text(r["start"]):
+        it["start"] = start_text(r["start"])
+    if r["questlines"]:
+        ql = data["questlines"].get(r["questlines"][0])
+        if ql and ql["name"]:
+            it["questline"] = ql["name"]
+            if ql.get("goal"):
+                it["goal"] = ql["goal"]
+        it["steps"] = steps(r, r["questlines"][0], pool)
+    if r["energy"]:
+        it["energy"] = r["energy"]
+    return it
+
+
+def steps_pool(data, skip_locked=False):
+    rows = [r for r in titled(data["rows"]) if not (skip_locked and r["energy"] == LOCKED)]
+    return week_rows(rows) + board_rows(rows)
+
+
+# ---------------------------------------------------------------- the three cards
+
+def build_morning(data, T, ledger):
+    rows = today_rows(data, T)
+    pool = steps_pool(data)
+    todo = sorted((r for r in rows if r["status"] != CLEARED),
+                  key=lambda r: (RANK.get(r["type"], 3), r["date"] is None, r["date"] or ""))
+    done = [r for r in rows if r["status"] == CLEARED]
+    items = []
+    for r in todo + done:
+        tags = (["↩︎ from yesterday"] if r["date"] and day(r["date"]) < T else []) + (["⏸ delayed"] if r["status"] == DELAY else [])
+        items.append(item(r, data, pool, tags, live=r["status"] == GRINDING, done=r["status"] == CLEARED))
+    card = {
+        "kind": "morning", "badge": "☀️", "eyebrow": f"Morning briefing · {label(T)}", "title": f"Today · {label(T)}",
+        "subtitle": f"{plural(len(todo), 'quest')} to do · win the day = clear 1 ⭐",
+        "progress": {"done": len(done), "total": len(rows)},
+        "sections": [{"heading": "Today", "items": items,
+                      "empty": "No quests today. Open the board and pull one from 🪧 Quest Board in as ⭐."}],
+    }
+    first = next((r for r in todo if r["type"] == MAIN), todo[0] if todo else None)
+    if first and start_text(first["start"]):
+        card["callout"] = {"label": "2-minute start", "text": start_text(first["start"])}
+    card["note"] = "⭐ first, 🎮 after. Use a quest's status slot to update it."
+    card["timeoutSec"] = 1800
+    return card
+
+
+def build_midday(data, T, ledger):
+    rows = [r for r in today_rows(data, T) if r["status"] != CLEARED]
+    rows.sort(key=lambda r: (RANK.get(r["type"], 3), 0 if r["type"] == MAIN and r["status"] == GRINDING else 1))
+    pool = steps_pool(data)
+    card = {"kind": "midday", "badge": "🕛", "eyebrow": f"Midday check · {label(T)}"}
+    if not rows:
+        card.update(title="All clear for today!", subtitle="✅ Enjoy 🎮 tonight, and stop on time.", sections=[])
+    else:
+        items = [item(r, data, pool, ["↩︎ from yesterday"] if day(r["date"]) and day(r["date"]) < T else None,
+                      live=r["status"] == GRINDING) for r in rows]
+        card.update(title=f"{plural(len(rows), 'quest')} left for tonight",
+                    subtitle="Start the ⭐ quest as soon as you're home.", sections=[{"items": items}])
+        if start_text(rows[0]["start"]):
+            card["callout"] = {"label": "Tonight's 2-minute start", "text": start_text(rows[0]["start"])}
+    card["timeoutSec"] = 1800
+    return card
+
+
+def latest(entries):
+    return max(entries, key=lambda e: parse_ts(e.get("at")) or EPOCH)
+
+
+def clear_day(r, ledger):
+    hits = [e for e in ledger if e.get("id") == r["id"] and e.get("status") == CLEARED]
+    return local_day(latest(hits).get("at")) if hits else local_day(r["edited"])
+
+
+def moved_by_card(ledger, ids, T):
+    """id -> day, for quests whose latest card click today was "Move" to a later day."""
+    by_id = {}
+    for e in ledger:
+        if e.get("id") in ids:
+            by_id.setdefault(e["id"], []).append(e)
+    out = {}
+    for i, es in by_id.items():
+        e = latest(es)
+        if local_day(e.get("at")) == T and e.get("status") == TODO and day(e.get("date")) and day(e["date"]) > T:
+            out[i] = day(e["date"])
+    return out
+
+
+def build_evening(data, T, ledger):
+    TM = T + timedelta(days=1)
+    rows = [r for r in titled(data["rows"]) if r["energy"] != LOCKED]
+    week = week_rows(rows)
+    pool = week + board_rows(rows)
+    A = [r for r in week if day(r["date"]) == T]
+    a_ids = {r["id"] for r in A}
+    E = [r for r in rows if r["status"] == CLEARED and r["id"] not in a_ids and clear_day(r, ledger) == T]
+    today = A + E
+    X, Y = sum(r["status"] == CLEARED for r in A) + len(E), len(today)
+    main_ok = any(r["type"] == MAIN and r["status"] == CLEARED and clear_day(r, ledger) == T for r in rows)
+    delayed = [r for r in week if r["status"] == DELAY]
+    moved = moved_by_card(ledger, {r["id"] for r in rows}, T)
+    unfinished = [r for r in week if day(r["date"]) <= T and r["status"] not in (CLEARED, DELAY)]
+    mains = {r["date"] for r in week if r["type"] == MAIN and r["status"] == CLEARED}
+    streak, d = (1 if main_ok else 0), T - timedelta(days=1)
+    while d.isoformat() in mains:
+        streak, d = streak + 1, d - timedelta(days=1)
+
+    plan, seen = [], set()
+    for r in [r for r in week if day(r["date"]) == TM and r["status"] != CLEARED] + delayed + unfinished:
+        if r["id"] not in seen:
+            plan.append(r)
+            seen.add(r["id"])
+    plan.sort(key=lambda r: RANK.get(r["type"], 3))
+    carried = {r["id"] for r in unfinished}
+
+    def today_tags(r):
+        return ((["→ rolls to tomorrow"] if r["id"] in carried else []) + (["⏸ delayed to tomorrow"] if r["status"] == DELAY else [])
+                + ([f"→ moved to {label(moved[r['id']])}"] if r["id"] in moved else []))
+
+    m, f = sum(r["type"] == MAIN for r in plan), sum(r["type"] == FUN for r in plan)
+    card = {
+        "kind": "evening", "badge": "🌙", "eyebrow": f"Evening report · {label(T)}",
+        "title": f"Tomorrow: {m} ⭐ + {f} 🎮" if plan else "Nothing planned for tomorrow",
+        "subtitle": "Today is won. Sleep on time 🛌" if main_ok else "No worries, ⭐ first tomorrow. Sleep on time 🛌",
+    }
+    if Y:
+        card["progress"] = {"done": X, "total": Y}
+    card["stats"] = [{"icon": "✅", "value": f"{X}/{Y}", "label": "quests"},
+                     {"icon": "⭐", "value": "✅" if main_ok else "❌", "label": "main"},
+                     {"icon": "⏸", "value": str(len({r["id"] for r in delayed} | set(moved))), "label": "moved"},
+                     {"icon": "🔥", "value": str(streak), "label": "day streak"}]
+    card["sections"] = [
+        {"heading": "Today", "items": [item(r, data, pool, today_tags(r), done=r["status"] == CLEARED) for r in today]},
+        {"heading": f"Tomorrow · {label(TM)}", "items": [item(r, data, pool, ["↩︎"] if r["id"] in carried else None) for r in plan],
+         "empty": "Nothing yet. Open the board and plan 1 ⭐ for tomorrow."},
+    ]
+    first_main = next((r for r in plan if r["type"] == MAIN), None)
+    if first_main and start_text(first_main["start"]):
+        card["callout"] = {"label": "Tomorrow's 2-minute start", "text": start_text(first_main["start"])}
+    if T.isoweekday() == 7:   # the weekly reset runs at 22:30, after this report
+        card["note"] = "🗓️ The weekly reset runs at 22:30 tonight and plans next week."
+    elif not any(r["type"] == MAIN and day(r["date"]) == TM for r in week):
+        card["note"] = "⚠️ Tomorrow has no ⭐ Main yet: plan one on the board (or run the weekly reset to catch up)."
+    card["timeoutSec"] = 1800
+    return card
+
+
+BUILD = {"morning": build_morning, "midday": build_midday, "evening": build_evening}
+EYEBROW = {"morning": ("☀️", "Morning briefing"), "midday": ("🕛", "Midday check"), "evening": ("🌙", "Evening report")}
+
+
+def make_card(kind, T, dry, fixture=None, save_fixture=None):
+    extra = []
+    if fixture:
+        with open(fixture, encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        token = read_token()
+        if not token:
+            raise NotionError(-1, "no Notion token in the Keychain")
+        if not dry:
+            apply_queue(token)
+        data = fetch(token)
+        if save_fixture:
+            with open(save_fixture, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+    if dry or fixture:
+        overlay(data["rows"], queued(), extra)
+    data["rows"].sort(key=lambda r: (RANK.get(r["type"], 3), r["date"] is None, r["date"] or ""))
+    ledger = [e for e in pending.read_json(pending.LEDGER, "applied") if isinstance(e, dict)] + extra
+    return BUILD[kind](data, T, ledger)
+
+
+def offline_card(kind, T, err):
+    why = {-1: "No Notion token in the Keychain yet (README: Saving done to Notion).",
+           0: "Notion can't be reached right now (offline?).",
+           401: "Notion rejected the token: save a new one in the Keychain (README).",
+           404: "The integration can't see the Quest Log databases: connect it to 🗂️ Quest Log Data."}
+    badge, name = EYEBROW[kind]
+    return {"kind": kind, "badge": badge, "eyebrow": f"{name} · {label(T)}", "title": "Couldn't read the Quest Log",
+            "subtitle": why.get(err.code, str(err)), "sections": [],
+            "note": "Open the board for today's quests. Log: QuestLog/runs/launchd-%s.log" % kind, "timeoutSec": 1800,
+            "display": "compact"}
+
+
+# ---------------------------------------------------------------- runs
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def prune_runs():
+    cutoff = time.time() - KEEP_DAYS * 86400
+    for name in os.listdir(RUNS) if os.path.isdir(RUNS) else []:
+        p = os.path.join(RUNS, name)
+        if re.match(r"\d{4}-\d\d-\d\d-", name) and os.path.getmtime(p) < cutoff:
+            os.remove(p)
+
+
+def build_with_retry(kind, T, dry, args):
+    for n in range(7 if args.scheduled else 1):  # after a wake-up the network can take a minute or two
+        try:
+            return make_card(kind, T, dry, args.fixture, args.save_fixture)
+        except NotionError as e:
+            if e.code != 0 or n == 6 or not args.scheduled:
+                raise
+            log(f"{kind}: {e}; retrying in 30 s")
+            time.sleep(30)
+
+
+def run(kind, args, now=None):
+    now = now or datetime.now()
+    T = date.fromisoformat(args.today) if args.today else (scheduled_day(kind, now) if args.scheduled else now.date())
+    if T is None:
+        log(f"{kind}: skipped, {now:%H:%M} is outside its window")
+        return 0
+    dry = args.dry_run or bool(args.fixture)
+    held = False
+    if args.scheduled and not dry:
+        if qlstate.is_done(T, kind):
+            log(f"{kind}: already shown for {T}")
+            return 0
+        if not qlstate.claim(T, kind):  # the calendar agent and the catch-up can wake up together
+            log(f"{kind}: another run is on it")
+            return 0
+        held = True
+    try:
+        return _run_locked(kind, T, dry, args)
+    finally:
+        if held:
+            qlstate.release(T, kind)
+
+
+def _run_locked(kind, T, dry, args):
+    stamp = qlstate.stamp(T, kind)
+    try:
+        card = build_with_retry(kind, T, dry, args)
+    except NotionError as e:
+        log(f"{kind}: {e}")
+        if dry:
+            return 1
+        card = offline_card(kind, T, e)
+        if args.scheduled:
+            # Tell the user once a day; stay unmarked so the next catch-up tick tries again, quietly.
+            if os.path.exists(stamp + ".errshown"):
+                return 1
+            write_json(stamp + ".json", card)
+            subprocess.run([sys.executable, SHOW, stamp + ".json", "--no-stamp", "--no-save"], check=False, timeout=60)
+            open(stamp + ".errshown", "w").close()
+            return 1
+    if dry:
+        print(json.dumps(card, ensure_ascii=False, indent=1))
+        return 0
+    write_json(stamp + ".json", card)
+    subprocess.run([sys.executable, SHOW, stamp + ".json", "--source", "local"], check=False, timeout=60)
+    qlstate.mark(T, kind)
+    qlstate.write_status(card, T)  # the menu-bar badge, with the day this card is for
+    prune_runs()
+    log(f"{kind}: card shown for {T}: {card.get('title', '')}")
+    return 0
+
+
+# ---------------------------------------------------------------- open any time, catch-up, gate, status
+
+def _at(args):
+    if getattr(args, "at", None):
+        try:
+            return datetime.strptime(args.at, "%Y-%m-%d %H:%M")
+        except ValueError:
+            sys.exit('--at needs "YYYY-MM-DD HH:MM"')
+    return datetime.now()
+
+
+def _show(card, *flags):
+    os.makedirs(RUNS, exist_ok=True)
+    path = os.path.join(RUNS, "now.json")
+    write_json(path, card)
+    subprocess.run([sys.executable, SHOW, path, *flags], check=False, timeout=60)
+
+
+def now_cmd(rest, args):
+    """The menu-bar button: show a card right now, whatever the clock says and whether or not it was shown before."""
+    now = _at(args)
+    kind, T = qlstate.kind_for_now(now)
+    if rest:
+        if rest[0] not in qlstate.KINDS:
+            sys.exit("usage: report.py now [morning|midday|evening|weekly]")
+        kind = rest[0]
+        T = now.date() if kind != "evening" or now.hour >= 4 else now.date() - timedelta(days=1)
+    if not qlstate.claim(date.today(), "now", ttl=20):  # a double click: the first one is already on it
+        log("now: another open is in progress")
+        return 0
+    try:
+        cached = qlstate.load_last(kind)
+        saved = qlstate.saved_at(cached) if cached else None
+        if cached and (kind == "weekly" or (saved and (datetime.now(saved.tzinfo) - saved).total_seconds() < 180)):
+            _show(cached, "--no-stamp", "--no-save")  # opened a moment ago: show it at once
+            return 0
+        if kind == "weekly":  # written by the Claude task (it plans the week), so there is nothing to build here
+            _show(_no_card(kind, "No weekly card yet",
+                           "The weekly reset runs on Sundays at 22:30 and its card is saved here afterwards."), "--no-stamp", "--no-save")
+            return 0
+        try:
+            card = make_card(kind, T, False)
+        except NotionError as e:
+            log(f"now {kind}: {e}")
+            fallback = cached or qlstate.newest_saved()  # this kind's last card, else the newest of any kind
+            fsaved = qlstate.saved_at(fallback) if fallback else None
+            if fallback and fsaved:
+                card = dict(fallback)
+                card["eyebrow"] = f"Saved {qlstate.age_text(fsaved)} · {card.get('eyebrow', kind.title())}"
+                card["note"] = "Couldn't reach Notion, so this is the last saved card. Changes you make are queued."
+            else:
+                card = offline_card(kind, T, e)
+            _show(card, "--no-stamp", "--no-save")
+            return 1
+        _show(card, "--no-stamp", "--source", "local")
+        return 0
+    finally:
+        qlstate.release(date.today(), "now")
+
+
+def _no_card(kind, title, text):
+    return {"kind": kind, "eyebrow": "Quest Log", "title": title, "subtitle": text, "sections": [], "timeoutSec": 600,
+            "display": "compact"}
+
+
+def catchup(args):
+    """After sleep, a shutdown or a late login: show the one card that is due and unseen, once the user is back."""
+    now = _at(args)
+    wanted = qlstate.due(now)
+    if not wanted:
+        log("catchup: nothing due")
+        return 0
+    mode = qlstate.mode()
+    latest = wanted[-1]
+    older = wanted[:-1]
+    names = ", ".join(f"{k} {T}" for k, T in wanted)
+    if args.dry_run:
+        print(f"due: {names}\nmode: {mode}\nwould {'show' if mode == 'live' or args.force else 'only log (shadow)'} {latest[0]} {latest[1]}"
+              + (f", skip {', '.join(k for k, _ in older)}" if older else ""))
+        return 0
+    if mode != "live" and not args.force:
+        log(f"catchup: due {names}; shadow mode, the Claude tasks show the cards")
+        return 0
+    if qlstate.idle_seconds() > 600:
+        log(f"catchup: due {names}; waiting until you are back at the Mac")
+        return 0
+    if qlstate.card_open():
+        log(f"catchup: due {names}; a card is open, not interrupting")
+        return 0
+    for kind, T in older:  # a newer card covers the older ones: never stack three on a late wake-up
+        qlstate.mark(T, kind, "skipped")
+        log(f"catchup: skipped {kind} {T}, {latest[0]} covers it")
+    a = argparse.Namespace(scheduled=True, today=None, dry_run=False, fixture=None, save_fixture=None)
+    return run(latest[0], a, now)
+
+
+def gate(kind, args):
+    """For the Claude tasks, as their first step: should this run show a card at all?"""
+    now = _at(args)
+    T = scheduled_day(kind, now)
+    if T is None:
+        print(f"skip: {now:%H:%M} is outside the {kind} window; a later card covers it")
+        return 3
+    if qlstate.mode() == "live":
+        print("skip: the local runner is live and shows this card")
+        return 3
+    if qlstate.is_done(T, kind):
+        print(f"skip: the {kind} card for {T} was already shown")
+        return 3
+    print(f"go {T}")
+    return 0
+
+
+def status_cmd():
+    now = datetime.now()
+    print(f"mode: {qlstate.mode()}  (live = the local runner shows the cards; shadow = the Claude tasks do)")
+    missing = 'MISSING: security add-generic-password -s "QuestLog Notion" -a token -w'
+    print("token: " + ("found" if read_token() else missing))
+    print(f"idle: {qlstate.idle_seconds():.0f}s   card open: {qlstate.card_open()}")
+    for kind in TIMES:
+        T = scheduled_day(kind, now)
+        s = qlstate.stamp(T, kind) if T else None
+        state = "outside its window" if T is None else ("shown" if os.path.exists(s + ".shown") else
+                "skipped" if os.path.exists(s + ".skipped") else "not shown yet")
+        print(f"{kind:8} {TIMES[kind][0]:02d}:{TIMES[kind][1]:02d}  {state}")
+    due = qlstate.due(now)
+    print("due now: " + (", ".join(k for k, _ in due) if due else "nothing"))
+    for kind in qlstate.KINDS:
+        c = qlstate.load_last(kind)
+        t = qlstate.saved_at(c) if c else None
+        print(f"saved {kind:8} " + (f"{qlstate.age_text(t)} ({c.get('source', '?')})" if t else "none"))
+    st = qlstate.read_status()
+    print("badge: " + (f"{st['done']}/{st['total']} on {st['date']}" if st else "none"))
+    return 0
+
+
+# ---------------------------------------------------------------- comparison with the Claude tasks
+
+def _empty(v):
+    return v is None or v is False or v == "" or v == [] or v == {}
+
+
+def norm(v):
+    if isinstance(v, dict):
+        return {k: norm(x) for k, x in v.items() if not _empty(x)}
+    if isinstance(v, list):
+        return [norm(x) for x in v]
+    return v
+
+
+def _short(v):
+    s = json.dumps(v, ensure_ascii=False)
+    return s if len(s) <= 140 else s[:137] + "..."
+
+
+def diff(a, b, path="card", out=None):
+    """Differences between our card (a) and the Claude task's (b), as readable lines."""
+    out = [] if out is None else out
+    if isinstance(a, dict) and isinstance(b, dict):
+        for k in list(a) + [k for k in b if k not in a]:
+            if k not in b:
+                out.append(f"{path}.{k}: only ours = {_short(a[k])}")
+            elif k not in a:
+                out.append(f"{path}.{k}: only Claude's = {_short(b[k])}")
+            else:
+                diff(a[k], b[k], f"{path}.{k}", out)
+    elif isinstance(a, list) and isinstance(b, list):
+        titles = lambda xs: [x.get("title") for x in xs if isinstance(x, dict)]  # noqa: E731
+        if len(a) != len(b) or titles(a) != titles(b):
+            out.append(f"{path}: {len(a)} vs {len(b)} entries\n    ours:     {_short(titles(a))}\n    Claude's: {_short(titles(b))}")
+        keys = lambda xs: [x.get("url") or x.get("title") for x in xs if isinstance(x, dict)]  # noqa: E731
+        if len(keys(a)) == len(a) == len(b) and keys(a) != keys(b) and sorted(map(str, keys(a))) == sorted(map(str, keys(b))):
+            theirs = {str(k): x for k, x in zip(keys(b), b)}  # same entries in another order: compare them pairwise
+            for n, x in enumerate(a):
+                diff(x, theirs[str(keys(a)[n])], f"{path}[{n}]", out)
+            return out
+        for n in range(min(len(a), len(b))):
+            diff(a[n], b[n], f"{path}[{n}]", out)
+    elif a != b:
+        out.append(f"{path}: ours {_short(a)} | Claude's {_short(b)}")
+    return out
+
+
+def compare_cards(ours, claude):
+    return diff(norm(ours), norm(claude))
+
+
+def shadow(kind, args):
+    """Before go-live: build our card when the Claude task's card appears and log how they differ."""
+    now = datetime.now()
+    T = scheduled_day(kind, now)
+    if T != now.date():
+        log(f"shadow {kind}: skipped, {now:%H:%M} is outside its window")
+        return 0
+    started, path = time.time(), CLAUDE_CARD.format(kind)
+
+    def fresh():
+        try:
+            return os.path.getmtime(path) >= started - 20 * 60
+        except OSError:
+            return False
+
+    while not fresh() and time.time() < started + 45 * 60:
+        time.sleep(20)
+    found = fresh()
+    if found:
+        time.sleep(3)
+    stamp = os.path.join(RUNS, f"{T}-{kind}")
+    try:
+        ours = build_with_retry(kind, T, True, args)
+    except NotionError as e:
+        line = f"{T} {kind}: our build failed: {e}"
+    else:
+        write_json(stamp + ".local.json", ours)
+        if not found:
+            line = f"{T} {kind}: no Claude card within 45 min (app closed?); ours saved"
+        else:
+            shutil.copyfile(path, stamp + ".claude.json")
+            with open(path, encoding="utf-8") as f:
+                diffs = compare_cards(ours, json.load(f))
+            with open(stamp + ".diff.txt", "w", encoding="utf-8") as f:
+                f.write("\n".join(diffs) + "\n" if diffs else "match\n")
+            line = f"{T} {kind}: " + ("MATCH" if not diffs else f"{len(diffs)} difference(s), see runs/{T}-{kind}.diff.txt")
+    os.makedirs(RUNS, exist_ok=True)
+    with open(os.path.join(RUNS, "compare.log"), "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now():%Y-%m-%d %H:%M} {line}\n")
+    prune_runs()
+    log("shadow " + line)
+    return 0
+
+
+def compare_cmd(rest, args):
+    kind = rest[0] if rest and rest[0] in BUILD else sys.exit("usage: report.py compare morning|midday|evening [CLAUDE.json [LOCAL.json]]")
+    claude_path = rest[1] if len(rest) > 1 else CLAUDE_CARD.format(kind)
+    with open(claude_path, encoding="utf-8") as f:
+        claude = json.load(f)
+    if len(rest) > 2:
+        with open(rest[2], encoding="utf-8") as f:
+            ours = json.load(f)
+    else:
+        T = date.fromisoformat(args.today) if args.today else date.fromtimestamp(os.path.getmtime(claude_path))
+        ours = make_card(kind, T, True, args.fixture)
+    diffs = compare_cards(ours, claude)
+    print("\n".join(diffs) if diffs else "match")
+    return 0 if not diffs else 3
+
+
+# ---------------------------------------------------------------- setup
+
+def check():
+    token = read_token()
+    if not token:
+        print('No token: run  security add-generic-password -s "QuestLog Notion" -a token -w')
+        return 1
+    print("token: found in the Keychain")
+    try:
+        me = notion(token, "GET", "/users/me")
+        print(f"integration: {me.get('name') or me.get('id')}")
+        schema = notion(token, "GET", f"/databases/{QUESTS_DB}").get("properties", {})
+        data = fetch(token)
+    except NotionError as e:
+        print(e)
+        if e.code == 404:
+            print("Connect the integration to the page 🗂️ Quest Log Data (••• → Connections).")
+        return 1
+    rows = data["rows"]
+    print(f"quests: {len(rows)} ({len(titled(week_rows(rows)))} dated, {len(titled(board_rows(rows)))} on the Quest Board), "
+          f"on today: {sum(r['on_today'] == 'yes' for r in rows)}, questlines: {len(data['questlines'])}")
+    missing = [k for k in ("Quest", "Type", "Status", "Date", "Energy", "2-Min Start", "Questline", "Edited", "On Today")
+               if k not in schema]
+    if missing:
+        print("missing properties: " + ", ".join(missing))
+    return 1 if missing else 0
+
+
+def _bootstrap(name, plist):
+    domain = f"gui/{os.getuid()}"
+    path = os.path.expanduser(f"~/Library/LaunchAgents/{name}.plist")
+    with open(path, "wb") as f:
+        plistlib.dump(plist, f)
+    subprocess.run(["launchctl", "bootout", f"{domain}/{name}"], capture_output=True)
+    r = None
+    for _ in range(5):
+        r = subprocess.run(["launchctl", "bootstrap", domain, path], capture_output=True, text=True)
+        if r.returncode == 0:
+            break
+        time.sleep(1)
+    return r
+
+
+def install(live):
+    py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
+    os.makedirs(os.path.expanduser("~/Library/LaunchAgents"), exist_ok=True)
+    os.makedirs(RUNS, exist_ok=True)
+    env = {"PYTHONIOENCODING": "utf-8", "LANG": "en_US.UTF-8"}
+    qlstate.set_mode("live" if live else "shadow")
+    for kind, (h, m) in TIMES.items():
+        name = AGENT + kind
+        argv = [py, os.path.join(HERE, "report.py")] + ([kind, "--scheduled"] if live else ["shadow", kind])
+        r = _bootstrap(name, {"Label": name, "ProgramArguments": argv, "StartCalendarInterval": {"Hour": h, "Minute": m},
+                              "StandardOutPath": os.path.join(RUNS, f"launchd-{kind}.log"),
+                              "StandardErrorPath": os.path.join(RUNS, f"launchd-{kind}.log"),
+                              "EnvironmentVariables": env, "AbandonProcessGroup": True})
+        print(f"{name}: {h:02d}:{m:02d} {'live' if live else 'shadow'}" + ("" if r.returncode == 0 else f" (load failed: {r.stderr.strip()})"))
+    # Catch-up: at login (a Mac that was off at 07:30) and every 10 minutes (a sleep, a late network, an away user).
+    log_path = os.path.join(RUNS, "launchd-catchup.log")
+    r = _bootstrap(CATCHUP, {"Label": CATCHUP, "ProgramArguments": [py, os.path.join(HERE, "report.py"), "catchup"],
+                             "RunAtLoad": True, "StartInterval": 600, "StandardOutPath": log_path, "StandardErrorPath": log_path,
+                             "EnvironmentVariables": env, "AbandonProcessGroup": True})
+    print(f"{CATCHUP}: at login + every 10 min, {'live' if live else 'shadow (only logs)'}" + ("" if r.returncode == 0 else f" (load failed: {r.stderr.strip()})"))
+    # The menu-bar button: always on, it only opens a card when clicked.
+    bar = os.path.join(HERE, "questbar")
+    if os.access(bar, os.X_OK):
+        log_path = os.path.join(RUNS, "launchd-bar.log")
+        r = _bootstrap(BAR, {"Label": BAR, "ProgramArguments": [bar], "RunAtLoad": True, "KeepAlive": True,
+                             "ProcessType": "Interactive", "StandardOutPath": log_path, "StandardErrorPath": log_path,
+                             "EnvironmentVariables": env})
+        print(f"{BAR}: menu-bar button" + ("" if r.returncode == 0 else f" (load failed: {r.stderr.strip()})"))
+    else:
+        print("questbar is not built: swiftc -O QuestBar.swift -o questbar -framework Cocoa -framework Carbon")
+    return 0
+
+
+def uninstall():
+    for name in [AGENT + k for k in TIMES] + [CATCHUP, BAR]:
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{name}"], capture_output=True)
+        path = os.path.expanduser(f"~/Library/LaunchAgents/{name}.plist")
+        if os.path.exists(path):
+            os.remove(path)
+        print(f"{name}: removed")
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, usage=argparse.SUPPRESS)
+    ap.add_argument("cmd", choices=["morning", "midday", "evening", "shadow", "compare", "install", "uninstall", "check",
+                                    "now", "catchup", "gate", "status"])
+    ap.add_argument("rest", nargs="*")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--today")
+    ap.add_argument("--fixture")
+    ap.add_argument("--save-fixture")
+    ap.add_argument("--scheduled", action="store_true")
+    ap.add_argument("--live", action="store_true")
+    ap.add_argument("--at")
+    ap.add_argument("--force", action="store_true")
+    args = ap.parse_args(argv[1:])
+    if args.today:
+        date.fromisoformat(args.today)
+    if args.cmd in BUILD:
+        return run(args.cmd, args, _at(args) if args.at else None)
+    if args.cmd == "now":
+        return now_cmd(args.rest, args)
+    if args.cmd == "catchup":
+        return catchup(args)
+    if args.cmd == "gate":
+        if not args.rest or args.rest[0] not in BUILD:
+            ap.error("gate needs morning|midday|evening")
+        return gate(args.rest[0], args)
+    if args.cmd == "status":
+        return status_cmd()
+    if args.cmd == "shadow":
+        if not args.rest or args.rest[0] not in BUILD:
+            ap.error("shadow needs morning|midday|evening")
+        return shadow(args.rest[0], args)
+    if args.cmd == "compare":
+        return compare_cmd(args.rest, args)
+    if args.cmd == "install":
+        return install(args.live)
+    if args.cmd == "uninstall":
+        return uninstall()
+    return check()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

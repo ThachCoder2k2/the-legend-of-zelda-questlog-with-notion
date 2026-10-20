@@ -273,9 +273,11 @@
   .sidepane.in { animation: sidein .26s cubic-bezier(.2,.8,.2,1); }
   @keyframes sidein { from { opacity: 0; transform: translateX(-22px); } }
   /* In the window the stage hugs the right edge, so the card stays still while the window grows to the left
-     and the detail panel opens on the card's left. If the host had to grow to the right instead, it says so. */
-  body:not(.preview) .stage { margin-left: auto; }
-  body.grow-right:not(.preview) .stage { margin-left: 0; }
+     and the detail panel opens on the card's left. If the host had to grow to the right instead, it says so.
+     Pinned with right: 0 (not margin-left: auto) so that while the window is still narrower than the stage,
+     the overflow goes off the left edge and the card itself stays in view. */
+  body:not(.preview):not(.full) .stage { position: absolute; top: 0; right: 0; }
+  body.grow-right:not(.preview):not(.full) .stage { right: auto; left: 0; }
   .stage.flip { flex-direction: row-reverse; }
   .stage.flip .sidepane.in { animation-name: sidein-l; }
   @keyframes sidein-l { from { opacity: 0; transform: translateX(22px); } }
@@ -668,6 +670,10 @@
   /* ===== review fixes ===== */
   .sh .heart svg { color: var(--heart); }
   body.k-weekly .lists { max-height: 600px; }
+  /* a done row's tag is dimmed with opaque colours (half of the normal ones over the void), not opacity,
+     so the plate's border never shows through the label */
+  .q.done .qtag { opacity: 1; background: #101C27; border-color: #2E3F4C; color: #7A632B; }
+  .q.done .qtag.fun { color: #686484; }
 
   /* ===== full-screen Purah Pad (default): list left, detail right, tabs on top, prompts bottom-right ===== */
   body.full { background: radial-gradient(ellipse at 50% 40%, rgba(4,16,28,.82), rgba(0,0,0,.93)); }
@@ -1180,10 +1186,10 @@
     if (tags.length) { tg.appendChild(el("i", "ln")); tg.appendChild(put(el("span"), tags.join(" · "))); }
   };
   const renderRow = (r) => {
-    r.el.classList.toggle("done", r.now.status === STATUS.done);   // legacy rows without a url still dim when done
+    r.done = r.now.status === STATUS.done;         // before renderTg, which drops the tags a clear makes untrue
+    r.el.classList.toggle("done", r.done);         // legacy rows without a url still dim when done
     renderTg(r);
     if (!r.id) return;
-    r.done = r.now.status === STATUS.done;
     const moved = isMoved(r) || r.now.status === STATUS.delay;
     const live = r.now.status === STATUS.grinding;
     r.el.classList.toggle("done", r.done);
@@ -1230,7 +1236,7 @@
     const now = new Date(), slots = [[7, 30], [12, 0], [22, 0]];
     for (let d = 0; d < 8; d++) {
       const day = new Date(now); day.setDate(now.getDate() + d);
-      const list = day.getDay() === 0 ? [...slots, [20, 0]].sort((a, b) => a[0] - b[0]) : slots;
+      const list = day.getDay() === 0 ? [...slots, [22, 30]].sort((a, b) => a[0] - b[0] || a[1] - b[1]) : slots;   // Sunday: weekly reset at 22:30
       for (const [h, m] of list) {
         const t = new Date(day); t.setHours(h, m, 0, 0);
         if (t > now) return (d === 0 ? "at " : d === 1 ? "tomorrow at " : DAYS[t.getDay()] + " at ") + pad(h) + ":" + pad(m);
@@ -1560,7 +1566,11 @@
     s2.appendChild(t2); detail.appendChild(s2);
     let steps = Array.isArray(it.steps) ? it.steps.filter(x => x && x.title) : [];
     const isMine = (st) => pageId(st) ? pageId(st) === r.id : st.title === it.title;
-    const rowOf = (st) => { const pid = pageId(st); return pid ? rows.find(x => x.id === pid) : null; };
+    const rowOf = (st) => {   // by page id; a step without a url matches a row with the same title, if only one quest has it
+      const pid = pageId(st); if (pid) return rows.find(x => x.id === pid) || null;
+      const same = rows.filter(x => x.id && x.it.title === st.title);
+      return same.length && same.every(x => x.id === same[0].id) ? same[0] : null;
+    };
     const stepDone = (st) => { const row = rowOf(st); return row ? row.done : !!st.done; };
     if (steps.length > 8) {   // keep this quest, then unfinished steps, then the most recent cleared ones
       const keep = new Set([...steps.filter(isMine), ...steps.filter(st => !isMine(st) && !stepDone(st)), ...steps.filter(stepDone).reverse()].slice(0, 8));
@@ -1671,7 +1681,12 @@
 
   rows.forEach(r => {
     if (!r.id) return;
-    r.el.addEventListener("mouseenter", () => { if (!menuRow) select(r); });
+    // Hover selects only when the pointer really moves, so a pointer resting under the card as it opens (the
+    // menu-bar button leaves it near the top) never steals the cursor from the first quest.
+    r.el.addEventListener("mousemove", (e) => {
+      if (menuRow || r === sel || performance.now() - goAt < 600 || !(e.movementX || e.movementY)) return;
+      select(r);
+    });
     r.el.addEventListener("click", (e) => { if (e.target.closest(".mk") || menuRow) return; select(r); });
     r.el.addEventListener("dblclick", (e) => { if (e.target.closest(".mk")) return; openDetail(r); });
     r.mk.addEventListener("click", (e) => { e.stopPropagation(); if (menuRow) closeMenu(false); select(r, { sound: false }); toggleTrack(r); });

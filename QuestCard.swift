@@ -244,12 +244,19 @@ final class CardController: NSObject, NSApplicationDelegate, WKScriptMessageHand
         // The first click on it makes the panel key (nonactivating, so the other app stays active).
         panel.orderFrontRegardless()
         if let name = soundName, !name.isEmpty { play(name) }
-        NSAnimationContext.runAnimationGroup { ctx in
+        let target = NSRect(x: x, y: y, width: width, height: h)
+        pendingFrame = target   // a resize during the slide-in builds on where the card is going, not where it is
+        animToken += 1
+        let token = animToken
+        NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.42
             ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1)
             panel.animator().alphaValue = 1
-            panel.animator().setFrame(NSRect(x: x, y: y, width: width, height: h), display: true)
-        }
+            panel.animator().setFrame(target, display: true)
+        }, completionHandler: { [weak self] in
+            guard let self = self, self.animToken == token else { return }
+            self.pendingFrame = nil
+        })
         web.evaluateJavaScript("window.QL_GO && window.QL_GO()", completionHandler: nil)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.panel.invalidateShadow() }
     }
@@ -312,7 +319,10 @@ final class CardController: NSObject, NSApplicationDelegate, WKScriptMessageHand
         mode = newMode
         let target: NSRect
         if newMode == "full" {
-            compactFrame = pendingFrame ?? panel.frame
+            var c = pendingFrame ?? panel.frame   // remember the card's own spot, not the detail panel's beside it
+            if anchoredRight { c.origin.x = c.maxX - 440 }
+            c.size.width = 440
+            compactFrame = c
             panel.level = .statusBar
             target = screen.frame
         } else {

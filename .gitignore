@@ -10,3 +10,7 @@ sounds/*.wav
 sounds/custom/*
 !sounds/custom/README.txt
 .DS_Store
+# menu-bar button binary (rebuild: swiftc -O QuestBar.swift -o questbar -framework Cocoa -framework Carbon)
+questbar
+# runtime state of the runner (stamps, last cards, logs)
+runs/

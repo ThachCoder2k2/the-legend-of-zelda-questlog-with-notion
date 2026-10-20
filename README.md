@@ -13,9 +13,35 @@ questlog-weekly-reset.
   a plain AppleScript dialog if `questcard` is missing.
 - `pending.py`: queue of quest status changes clicked on the card (`pending.json`), applied by
   the next scheduled task (`list`, `done ID AT`, `applied`).
+- `report.py`: builds the morning / midday / evening cards straight from the Notion API, without Claude
+  (see "Local runner" below).
 - `make_sounds.py` → `sounds/*.wav`: original synthesized menu sounds (open, move, scroll, select,
   done, undo, cancel, track, untrack, close). Edit and re-run to change them; `"sound": ""` in the card JSON mutes the card.
   Your own files in `sounds/custom/` (same names, .wav/.aiff/.caf/.m4a/.mp3) replace the built-in ones.
+
+## When the Mac was asleep, off or away (catch-up) and the button
+
+- **Sleep:** launchd runs a job that was due during sleep as soon as the Mac wakes up (that is why 07:30 can show at 08:16).
+- **Powered off:** launchd skips those jobs, so `com.questlog.catchup` also runs at login and every 10 minutes. It shows
+  the one card that is due and unseen, **only once you are back at the Mac** (keyboard or mouse used in the last 10 minutes)
+  and **never on top of a card that is open**. A card only counts inside its window: morning 07:00–12:00, midday
+  11:30–22:00, evening 21:30–04:00 (the evening report after midnight is still for the previous day). Windows end before
+  the next card is due, so a late start shows one card, never a stack. The weekly reset has its own catch-up (the
+  Monday–Saturday check in its prompt).
+- **Live vs shadow** (`python3 report.py status`): *shadow* (default) = the Claude tasks show the cards and the local runner
+  only logs; *live* (`python3 report.py install --live`, needs the Notion token: `report.py check`) = the local runner
+  shows them, even with the Claude app closed, and the Claude tasks stop themselves at their "late guard" step.
+  Without the token the catch-up can't build a card, so it shows one small notice per day and keeps retrying quietly.
+- **Late guard:** the three daily Claude prompts start with `report.py gate KIND`: it says "skip" outside the window, when
+  the card was already shown, or when the local runner is live; otherwise "go DATE".
+- **The button:** `questbar` puts a ◎ in the menu bar (badge = today's cleared/total). Click, or **⌃⌥Q** anywhere = open
+  the card now (`report.py now`): live from Notion, or, when Notion can't be reached, the last saved card labelled
+  "Saved 22:11". Right-click: Morning / Midday / Evening / Weekly (last one) / the board / Quit. Every card ever shown is
+  saved in `runs/last-KIND.json`, so the button also works offline. A manual open never marks a slot as shown.
+- Files: `qlstate.py` (windows, stamps, claim locks, saved cards, mode), `QuestBar.swift` → `questbar`
+  (`swiftc -O QuestBar.swift -o questbar -framework Cocoa -framework Carbon`), logs in `runs/`.
+  `report.py install` loads: the three daily agents, `com.questlog.catchup`, `com.questlog.bar`; `uninstall` removes them.
+  A true desktop widget (WidgetKit) would need a signed app extension built in Xcode; the menu-bar button covers the same use.
 
 ## Full screen (default)
 
@@ -50,15 +76,53 @@ Keys work only after you click the card once, so typing in another app never rea
 The card has no Notion access of its own, so a click is saved one of two ways:
 
 1. **Queued (default):** written to `pending.json` (status, plus date for a move); the next scheduled Quest Log task
-   (07:30, 12:00, 22:00, Sunday 20:00) applies it through the Notion connector first thing.
+   (07:30, 12:00, 22:00, Sunday 22:30) applies it through the Notion connector first thing.
 2. **Instant (optional):** give the card its own Notion integration token.
    1. Notion → Settings → Connections → Develop or manage integrations → New integration
       (internal, your workspace, capabilities: Read + Update content). Copy the secret.
-   2. Open the Quest Log page → ••• → Connections → add that integration.
+   2. Open the page **🗂️ Quest Log Data** → ••• → Connections → add that integration. That page holds the
+      Quests and Questlines databases; it is a separate top-level page, so connecting only the Quest Log board
+      page is not enough (every call would fail with 404).
    3. In Terminal: `security add-generic-password -s "QuestLog Notion" -a token -w`
       (it asks for the secret; paste it there, so it never lands in shell history).
    Remove it with `security delete-generic-password -s "QuestLog Notion" -a token`.
    If Notion cannot be reached, the click falls back to the queue.
+   Test it with `python3 report.py check`.
+
+## Local runner (no Claude needed)
+
+`report.py` makes the 07:30, 12:00 and 22:00 cards itself from the Notion API with the token above: a few
+seconds, no Claude tokens, and it works with the Claude app closed. It follows the prompts of
+questlog-morning-report, questlog-evening-reminder and questlog-evening-report (~/.claude/scheduled-tasks/…/SKILL.md)
+step by step, including step 0 (queued clicks are written to Notion and recorded in applied.json through
+`pending.py done`). The Sunday weekly reset stays a Claude task: it needs planning judgement.
+
+| command | does |
+|---|---|
+| `python3 report.py morning` (or `midday`, `evening`) | apply queued clicks, read Notion, show the card |
+| `… --dry-run` | print the card JSON only: no Notion writes, pending.json untouched, no card |
+| `… --today 2026-10-21` | build the card for another day |
+| `python3 report.py compare evening` | diff the Claude task's last card (`/tmp/questlog-evening-card.json`) against ours |
+| `python3 report.py install` / `install --live` / `uninstall` | LaunchAgents at 07:30, 12:00, 22:00 (`~/Library/LaunchAgents/com.questlog.report.*.plist`) |
+| `python3 report.py check` | token, Notion access, row counts |
+
+**Shadow mode (installed now).** The LaunchAgents show nothing and write nothing to Notion. Each one waits for
+the Claude task's card, builds ours at that moment and appends the result to `runs/compare.log`
+(differences in `runs/DATE-KIND.diff.txt`). Once a few days read `MATCH`, go live:
+run `python3 report.py install --live`, then turn off the three Claude tasks (morning, midday, evening) in the
+Claude app so the card doesn't show twice. Undo: `python3 report.py install` (back to shadow) and turn them on again.
+
+Live runs: a run that fires after a wake-up only shows when it still makes sense (morning 07:00–12:00,
+midday 11:30–22:00, evening 21:30–04:00, after midnight as the previous day's report), each card once a day;
+if Notion can't be read the card says why instead of staying silent. Cards and logs: `runs/` (kept 30 days).
+
+Known differences from the Claude tasks:
+- "Wrap shell commands in backticks" is judgement in the prompts; `report.py` wraps commands it recognises
+  (git, npm, python3, head, … with their arguments, e.g. `git status --short | head -40`).
+- The API returns 2-Min Start without the connector's Markdown escapes (`~31 min`, not `\~31 min`).
+- 1 quest reads "1 quest to do" / "1 quest left" instead of "1 quests".
+- The evening "cleared today" count also sees undated quests cleared today, which the connector's views can't show.
+- If you edit a task prompt, `report.py` doesn't follow by itself: change it too (shadow mode will show the drift).
 
 ## Card JSON
 

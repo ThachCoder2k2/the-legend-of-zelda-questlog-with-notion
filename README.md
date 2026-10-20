@@ -22,22 +22,31 @@ questlog-weekly-reset.
 ## When the Mac was asleep, off or away (catch-up) and the button
 
 - **Sleep:** launchd runs a job that was due during sleep as soon as the Mac wakes up (that is why 07:30 can show at 08:16).
+  A wake-up on the lock screen (or a dark wake / Power Nap) is not you being there, so the card waits; `questbar` runs the
+  catch-up again 5 s after a wake-up and after you unlock, so it appears at once instead of at the next 10-minute tick.
 - **Powered off:** launchd skips those jobs, so `com.questlog.catchup` also runs at login and every 10 minutes. It shows
   the one card that is due and unseen, **only once you are back at the Mac** (keyboard or mouse used in the last 10 minutes)
-  and **never on top of a card that is open**. A card only counts inside its window: morning 07:00–12:00, midday
-  11:30–22:00, evening 21:30–04:00 (the evening report after midnight is still for the previous day). Windows end before
-  the next card is due, so a late start shows one card, never a stack. The weekly reset has its own catch-up (the
-  Monday–Saturday check in its prompt).
+  and **never on top of a card that is open**. A card only counts inside its window: morning 07:00–11:30, midday
+  11:30–21:30, evening 21:30–04:00 (the evening report after midnight is still for the previous day). The windows tile the
+  day, so a late start shows one card, never a stack and never two within minutes. On Sundays the evening window closes at
+  22:30, when the weekly reset starts moving quests, so the report never shows numbers the reset already changed. The weekly
+  reset has its own catch-up (the Monday–Saturday check in its prompt) and waits for the Sunday evening report (`gate weekly`).
 - **Live vs shadow** (`python3 report.py status`): *shadow* (default) = the Claude tasks show the cards and the local runner
   only logs; *live* (`python3 report.py install --live`, needs the Notion token: `report.py check`) = the local runner
   shows them, even with the Claude app closed, and the Claude tasks stop themselves at their "late guard" step.
-  Without the token the catch-up can't build a card, so it shows one small notice per day and keeps retrying quietly.
+  Without the token the catch-up can't build a card, so it shows one small notice per day (any kind) and keeps retrying quietly.
 - **Late guard:** the three daily Claude prompts start with `report.py gate KIND`: it says "skip" outside the window, when
   the card was already shown, or when the local runner is live; otherwise "go DATE".
-- **The button:** `questbar` puts a ◎ in the menu bar (badge = today's cleared/total). Click, or **⌃⌥Q** anywhere = open
+- **The button:** `questbar` puts the game's gold quest marker in the menu bar (mint once today is cleared; the number is
+  today's cleared/total, as of the last card shown, hover for the time). Click, or **⌃⌥Q** anywhere = open
   the card now (`report.py now`): live from Notion, or, when Notion can't be reached, the last saved card labelled
   "Saved 22:11". Right-click: Morning / Midday / Evening / Weekly (last one) / the board / Quit. Every card ever shown is
-  saved in `runs/last-KIND.json`, so the button also works offline. A manual open never marks a slot as shown.
+  saved in `runs/last-KIND.json`, so the button also works offline. A manual open never marks a slot as shown, except when it opens a card that was due and unseen:
+  then that card counts as shown. `report.py KIND --today DATE` (a preview of another day) saves nothing.
+- **The "!" badge:** `runs/urgent.json` = `{"items": [{"title", "due" (ISO date-time or YYYY-MM-DD), "url"}]}` puts an
+  orange "!" on the icon: amber under 24 h, orange under 3 h, red and blinking under 1 h or overdue (the ring turns coral);
+  the right-click menu lists those quests with a countdown and opens them. Levels come from the clock, so they work offline.
+  Nothing writes that file yet (it needs a "Due" property on the Quests database).
 - Files: `qlstate.py` (windows, stamps, claim locks, saved cards, mode), `QuestBar.swift` → `questbar`
   (`swiftc -O QuestBar.swift -o questbar -framework Cocoa -framework Carbon`), logs in `runs/`.
   `report.py install` loads: the three daily agents, `com.questlog.catchup`, `com.questlog.bar`; `uninstall` removes them.
@@ -108,7 +117,8 @@ step by step, including step 0 (queued clicks are written to Notion and recorded
 
 **Shadow mode (installed now).** The LaunchAgents show nothing and write nothing to Notion. Each one waits for
 the Claude task's card, builds ours at that moment and appends the result to `runs/compare.log`
-(differences in `runs/DATE-KIND.diff.txt`). Once a few days read `MATCH`, go live:
+(differences in `runs/DATE-KIND.diff.txt`). Once a few days read `MATCH`, go live (first `touch runs/DATE-morning.shown runs/DATE-midday.shown` for the cards of
+today you already saw, or the catch-up shows them again):
 run `python3 report.py install --live`, then turn off the three Claude tasks (morning, midday, evening) in the
 Claude app so the card doesn't show twice. Undo: `python3 report.py install` (back to shadow) and turn them on again.
 

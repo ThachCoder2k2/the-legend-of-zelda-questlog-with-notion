@@ -36,6 +36,7 @@ Notion"). Python 3.9+ standard library only.
   says what it would do; catchup --force runs even in shadow mode.
 """
 import argparse
+import fcntl
 import json
 import os
 import plistlib
@@ -203,13 +204,18 @@ def read_token():
     return (r.stdout.strip() or None) if r.returncode == 0 else None
 
 
+INTERACTIVE = False   # the button sets it: fail fast to the saved card instead of retrying for a minute
+
+
 def notion(token, method, path, body=None, tries=4):
     data = None if body is None else json.dumps(body).encode()
+    if INTERACTIVE:
+        tries = 2
     for n in range(tries):
         req = urllib.request.Request(API + path, data=data, method=method, headers={
             "Authorization": "Bearer " + token, "Notion-Version": NOTION_VERSION, "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=20) as r:
+            with urllib.request.urlopen(req, timeout=8 if INTERACTIVE else 20) as r:
                 return json.load(r)
         except urllib.error.HTTPError as e:
             msg = e.read().decode("utf-8", "replace")
@@ -225,7 +231,7 @@ def notion(token, method, path, body=None, tries=4):
                 wait = 2 ** n
             time.sleep(min(wait, 30))
         except (urllib.error.URLError, OSError) as e:
-            if n == tries - 1:
+            if n == tries - 1 or INTERACTIVE:
                 raise NotionError(0, f"Notion unreachable: {getattr(e, 'reason', e)}")
             time.sleep(2 ** n)
 
@@ -284,6 +290,13 @@ def queued():
 
 def apply_queue(token):
     """Write the queued card clicks to Notion (Status, plus Date for a move) and drop them via pending.py done."""
+    os.makedirs(RUNS, exist_ok=True)
+    with open(os.path.join(RUNS, "queue.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # a scheduled run and the button must not write the same quest in turn
+        _apply_queue_locked(token)
+
+
+def _apply_queue_locked(token):
     r = subprocess.run([sys.executable, PENDING, "list"], capture_output=True, text=True, timeout=30)
     try:
         actions = json.loads(r.stdout or "[]")
@@ -300,6 +313,8 @@ def apply_queue(token):
             notion(token, "PATCH", f"/pages/{a['id']}", {"properties": props})
         except NotionError as e:
             log(f"click on {a.get('title') or a['id']} stays queued: {e}")
+            if e.code in (0, -1):  # offline or no token: every other click would fail the same way, slowly
+                return
             continue
         subprocess.run([sys.executable, PENDING, "done", a["id"], a.get("at", "")], capture_output=True, timeout=30)
         log(f"applied click: {a.get('title') or a['id']} → {a['status']}" + (f" on {a['date']}" if a.get("date") else ""))
@@ -546,12 +561,13 @@ def offline_card(kind, T, err):
     why = {-1: "No Notion token in the Keychain yet (README: Saving done to Notion).",
            0: "Notion can't be reached right now (offline?).",
            401: "Notion rejected the token: save a new one in the Keychain (README).",
-           404: "The integration can't see the Quest Log databases: connect it to 🗂️ Quest Log Data."}
+           404: "The integration can't see the Quest Log databases: connect it to 🗂️ Quest Log Data.",
+           -2: "Something unexpected went wrong while building the card. Details are in QuestLog/runs/."}
     badge, name = EYEBROW[kind]
     return {"kind": kind, "badge": badge, "eyebrow": f"{name} · {label(T)}", "title": "Couldn't read the Quest Log",
             "subtitle": why.get(err.code, str(err)), "sections": [],
-            "note": "Open the board for today's quests. Log: QuestLog/runs/launchd-%s.log" % kind, "timeoutSec": 1800,
-            "display": "compact"}
+            "note": "Open the board for today's quests. Logs: QuestLog/runs/ (launchd-%s.log, launchd-catchup.log, bar.log)" % kind,
+            "timeoutSec": 300, "display": "compact"}
 
 
 # ---------------------------------------------------------------- runs
@@ -580,56 +596,96 @@ def build_with_retry(kind, T, dry, args):
             if e.code != 0 or n == 6 or not args.scheduled:
                 raise
             log(f"{kind}: {e}; retrying in 30 s")
+            qlstate.touch_claim(T, kind)
             time.sleep(30)
 
 
-def run(kind, args, now=None):
+def run(kind, args, now=None, presence=True):
     now = now or datetime.now()
-    T = date.fromisoformat(args.today) if args.today else (scheduled_day(kind, now) if args.scheduled else now.date())
+    T = date.fromisoformat(args.today) if args.today else (scheduled_day(kind, now) or (None if args.scheduled else now.date()))
     if T is None:
         log(f"{kind}: skipped, {now:%H:%M} is outside its window")
         return 0
     dry = args.dry_run or bool(args.fixture)
     held = False
     if args.scheduled and not dry:
+        if qlstate.mode() != "live" and not getattr(args, "force", False):
+            log(f"{kind}: skipped, the mode is shadow (the Claude tasks show the cards)")
+            return 0
         if qlstate.is_done(T, kind):
             log(f"{kind}: already shown for {T}")
+            return 0
+        why = _not_now(kind, T, now, presence)
+        if why:
+            log(f"{kind}: {why}; the catch-up retries every 10 min")
             return 0
         if not qlstate.claim(T, kind):  # the calendar agent and the catch-up can wake up together
             log(f"{kind}: another run is on it")
             return 0
         held = True
+    real0 = datetime.now()
     try:
-        return _run_locked(kind, T, dry, args)
+        # the clock for the check after the build: `now` plus the time the build took (equal to the wall clock in real use)
+        return _run_locked(kind, T, dry, args, lambda: now + (datetime.now() - real0))
     finally:
         if held:
             qlstate.release(T, kind)
 
 
-def _run_locked(kind, T, dry, args):
+def _not_now(kind, T, now, presence=True):
+    """Why a scheduled card should not be shown at this moment (None = go): it was shown meanwhile, its window is over,
+    you are away or the screen is locked, or another card is open (an error notice does not count as one)."""
+    if qlstate.is_done(T, kind):
+        return "already shown"
+    if scheduled_day(kind, now) != T:
+        return f"{now:%H:%M} is outside its window now"
+    if presence and not qlstate.user_present():
+        return "you are away or the screen is locked"
+    if presence and qlstate.card_open() and not os.path.exists(qlstate.err_stamp(now)):
+        return "another card is open"
+    return None
+
+
+def _run_locked(kind, T, dry, args, now_fn=datetime.now):
     stamp = qlstate.stamp(T, kind)
     try:
         card = build_with_retry(kind, T, dry, args)
-    except NotionError as e:
+        if args.scheduled and not dry:  # a build can take minutes: is this card still wanted, and are you still there?
+            why = _not_now(kind, T, now_fn(), presence=True)
+            if why:
+                log(f"{kind}: built, but {why}; not showing it now")
+                return 0
+    except Exception as e:  # noqa: BLE001  NotionError, or anything a builder raises on an odd row or a cut response
+        if not isinstance(e, NotionError):
+            e = NotionError(-2, f"unexpected error: {e!r}")
         log(f"{kind}: {e}")
         if dry:
             return 1
         card = offline_card(kind, T, e)
         if args.scheduled:
             # Tell the user once a day; stay unmarked so the next catch-up tick tries again, quietly.
-            if os.path.exists(stamp + ".errshown"):
+            if os.path.exists(qlstate.err_stamp(now_fn())):
                 return 1
             write_json(stamp + ".json", card)
             subprocess.run([sys.executable, SHOW, stamp + ".json", "--no-stamp", "--no-save"], check=False, timeout=60)
-            open(stamp + ".errshown", "w").close()
+            open(qlstate.err_stamp(now_fn()), "w").close()
             return 1
+        write_json(stamp + ".json", card)  # a manual run: show the notice, remember nothing
+        subprocess.run([sys.executable, SHOW, stamp + ".json", "--no-stamp", "--no-save"], check=False, timeout=60)
+        return 1
     if dry:
         print(json.dumps(card, ensure_ascii=False, indent=1))
         return 0
     write_json(stamp + ".json", card)
-    subprocess.run([sys.executable, SHOW, stamp + ".json", "--source", "local"], check=False, timeout=60)
-    qlstate.mark(T, kind)
-    qlstate.write_status(card, T)  # the menu-bar badge, with the day this card is for
+    # A manual `report.py KIND` is a preview: it must not use up the slot of the real scheduled card.
+    flags = [] if args.scheduled else ["--no-stamp"] + (["--no-save"] if args.today else [])
+    r = subprocess.run([sys.executable, SHOW, stamp + ".json", "--source", "local", *flags], check=False, timeout=60)
+    if r.returncode != 0:
+        log(f"{kind}: the card could not be shown (show_card.py exit {r.returncode}); not marked, the catch-up retries")
+        return 1
+    if args.scheduled:
+        qlstate.mark(T, kind)
+        qlstate.write_status(card, T)  # the menu-bar badge, with the day this card is for
     prune_runs()
     log(f"{kind}: card shown for {T}: {card.get('title', '')}")
     return 0
@@ -662,14 +718,16 @@ def now_cmd(rest, args):
             sys.exit("usage: report.py now [morning|midday|evening|weekly]")
         kind = rest[0]
         T = now.date() if kind != "evening" or now.hour >= 4 else now.date() - timedelta(days=1)
-    if not qlstate.claim(date.today(), "now", ttl=20):  # a double click: the first one is already on it
+    global INTERACTIVE
+    INTERACTIVE = True
+    if not qlstate.claim(date.today(), "now", ttl=120):  # a double click: the first one is already on it
         log("now: another open is in progress")
         return 0
     try:
         cached = qlstate.load_last(kind)
         saved = qlstate.saved_at(cached) if cached else None
-        if cached and (kind == "weekly" or (saved and (datetime.now(saved.tzinfo) - saved).total_seconds() < 180)):
-            _show(cached, "--no-stamp", "--no-save")  # opened a moment ago: show it at once
+        if kind == "weekly" and cached:  # written by the Claude task that plans the week; nothing to build here
+            _show(cached, "--no-stamp", "--no-save")
             return 0
         if kind == "weekly":  # written by the Claude task (it plans the week), so there is nothing to build here
             _show(_no_card(kind, "No weekly card yet",
@@ -677,7 +735,9 @@ def now_cmd(rest, args):
             return 0
         try:
             card = make_card(kind, T, False)
-        except NotionError as e:
+        except Exception as e:  # noqa: BLE001  the button must always show something
+            if not isinstance(e, NotionError):
+                e = NotionError(-2, f"unexpected error: {e!r}")
             log(f"now {kind}: {e}")
             fallback = cached or qlstate.newest_saved()  # this kind's last card, else the newest of any kind
             fsaved = qlstate.saved_at(fallback) if fallback else None
@@ -688,8 +748,9 @@ def now_cmd(rest, args):
             else:
                 card = offline_card(kind, T, e)
             _show(card, "--no-stamp", "--no-save")
-            return 1
-        _show(card, "--no-stamp", "--source", "local")
+            return 0  # a card is on screen; the exit code is only non-zero when nothing could be shown
+        seen = (kind, T) in qlstate.due(now)  # you opened the card that was due: the catch-up must not show it again
+        _show(card, *([] if seen else ["--no-stamp"]), "--source", "local")
         return 0
     finally:
         qlstate.release(date.today(), "now")
@@ -718,33 +779,50 @@ def catchup(args):
     if mode != "live" and not args.force:
         log(f"catchup: due {names}; shadow mode, the Claude tasks show the cards")
         return 0
-    if qlstate.idle_seconds() > 600:
+    if not qlstate.user_present():
         log(f"catchup: due {names}; waiting until you are back at the Mac")
         return 0
-    if qlstate.card_open():
+    if qlstate.card_open() and not os.path.exists(qlstate.err_stamp(now)):
         log(f"catchup: due {names}; a card is open, not interrupting")
         return 0
     for kind, T in older:  # a newer card covers the older ones: never stack three on a late wake-up
         qlstate.mark(T, kind, "skipped")
         log(f"catchup: skipped {kind} {T}, {latest[0]} covers it")
-    a = argparse.Namespace(scheduled=True, today=None, dry_run=False, fixture=None, save_fixture=None)
-    return run(latest[0], a, now)
+    a = argparse.Namespace(scheduled=True, today=None, dry_run=False, fixture=None, save_fixture=None, force=args.force)
+    return run(latest[0], a, now, presence=False)
 
 
 def gate(kind, args):
-    """For the Claude tasks, as their first step: should this run show a card at all?"""
+    """For the Claude tasks, as their first step: should this run show a card at all? Always exit 0: the answer is the
+    printed line ("go DATE", "wait SECONDS: why" or "skip: why"), and a non-zero exit would read as a failure."""
     now = _at(args)
+    if kind == "weekly":
+        return gate_weekly(now)
     T = scheduled_day(kind, now)
     if T is None:
         print(f"skip: {now:%H:%M} is outside the {kind} window; a later card covers it")
-        return 3
-    if qlstate.mode() == "live":
-        print("skip: the local runner is live and shows this card")
-        return 3
+        return 0
     if qlstate.is_done(T, kind):
         print(f"skip: the {kind} card for {T} was already shown")
-        return 3
+        return 0
+    # The local runner only counts as "taking over" while it can actually build: with no token, or after it had to show
+    # its error notice for this slot, the Claude task is the one that has to deliver the card.
+    if qlstate.mode() == "live" and read_token() and not os.path.exists(qlstate.err_stamp(now)):
+        print("skip: the local runner is live and shows this card")
+        return 0
     print(f"go {T}")
+    return 0
+
+
+def gate_weekly(now):
+    """The weekly reset moves every unfinished quest into next week, so it must run after the evening report of the same
+    Sunday, in whatever order a late launch replays the two tasks. The evening window closes at 22:30 (qlstate.WEEKLY_AT),
+    so from then on a report that was never shown is a report that is never shown, and the reset may go."""
+    T = scheduled_day("evening", now)
+    if T is not None and T.isoweekday() == 7 and not qlstate.is_done(T, "evening"):
+        print(f"wait 120: the evening report for {T} has not been shown yet; check again in 2 minutes (give up after 40 minutes)")
+        return 0
+    print("go")
     return 0
 
 
@@ -875,7 +953,8 @@ def compare_cmd(rest, args):
         with open(rest[2], encoding="utf-8") as f:
             ours = json.load(f)
     else:
-        T = date.fromisoformat(args.today) if args.today else date.fromtimestamp(os.path.getmtime(claude_path))
+        mt = datetime.fromtimestamp(os.path.getmtime(claude_path))
+        T = date.fromisoformat(args.today) if args.today else (scheduled_day(kind, mt) or mt.date())
         ours = make_card(kind, T, True, args.fixture)
     diffs = compare_cards(ours, claude)
     print("\n".join(diffs) if diffs else "match")
@@ -930,7 +1009,11 @@ def install(live):
     os.makedirs(os.path.expanduser("~/Library/LaunchAgents"), exist_ok=True)
     os.makedirs(RUNS, exist_ok=True)
     env = {"PYTHONIOENCODING": "utf-8", "LANG": "en_US.UTF-8"}
-    qlstate.set_mode("live" if live else "shadow")
+    if live and not read_token():
+        print("Not going live: no Notion token in the Keychain, so the local runner could not build any card.\n"
+              'Add it (README: Saving "done" to Notion), run  report.py check, then install --live again.')
+        return 1
+    failed = []
     for kind, (h, m) in TIMES.items():
         name = AGENT + kind
         argv = [py, os.path.join(HERE, "report.py")] + ([kind, "--scheduled"] if live else ["shadow", kind])
@@ -939,22 +1022,31 @@ def install(live):
                               "StandardErrorPath": os.path.join(RUNS, f"launchd-{kind}.log"),
                               "EnvironmentVariables": env, "AbandonProcessGroup": True})
         print(f"{name}: {h:02d}:{m:02d} {'live' if live else 'shadow'}" + ("" if r.returncode == 0 else f" (load failed: {r.stderr.strip()})"))
+        if r.returncode != 0:
+            failed.append(name)
     # Catch-up: at login (a Mac that was off at 07:30) and every 10 minutes (a sleep, a late network, an away user).
     log_path = os.path.join(RUNS, "launchd-catchup.log")
     r = _bootstrap(CATCHUP, {"Label": CATCHUP, "ProgramArguments": [py, os.path.join(HERE, "report.py"), "catchup"],
                              "RunAtLoad": True, "StartInterval": 600, "StandardOutPath": log_path, "StandardErrorPath": log_path,
                              "EnvironmentVariables": env, "AbandonProcessGroup": True})
     print(f"{CATCHUP}: at login + every 10 min, {'live' if live else 'shadow (only logs)'}" + ("" if r.returncode == 0 else f" (load failed: {r.stderr.strip()})"))
+    if r.returncode != 0:
+        failed.append(CATCHUP)
     # The menu-bar button: always on, it only opens a card when clicked.
     bar = os.path.join(HERE, "questbar")
     if os.access(bar, os.X_OK):
         log_path = os.path.join(RUNS, "launchd-bar.log")
-        r = _bootstrap(BAR, {"Label": BAR, "ProgramArguments": [bar], "RunAtLoad": True, "KeepAlive": True,
+        r = _bootstrap(BAR, {"Label": BAR, "ProgramArguments": [bar], "RunAtLoad": True,
+                             "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": 30,
                              "ProcessType": "Interactive", "StandardOutPath": log_path, "StandardErrorPath": log_path,
                              "EnvironmentVariables": env})
         print(f"{BAR}: menu-bar button" + ("" if r.returncode == 0 else f" (load failed: {r.stderr.strip()})"))
     else:
         print("questbar is not built: swiftc -O QuestBar.swift -o questbar -framework Cocoa -framework Carbon")
+    if failed:  # the mode file stays as it was: run() refuses to show a scheduled card unless it says "live"
+        print("Some agents did not load (" + ", ".join(failed) + "); the mode stays " + qlstate.mode() + ".")
+        return 1
+    qlstate.set_mode("live" if live else "shadow")  # last: only once everything loaded
     return 0
 
 
@@ -965,6 +1057,7 @@ def uninstall():
         if os.path.exists(path):
             os.remove(path)
         print(f"{name}: removed")
+    qlstate.set_mode("shadow")  # no agents left: the Claude tasks must not skip their cards because of a stale "live"
     return 0
 
 
@@ -991,8 +1084,8 @@ def main(argv):
     if args.cmd == "catchup":
         return catchup(args)
     if args.cmd == "gate":
-        if not args.rest or args.rest[0] not in BUILD:
-            ap.error("gate needs morning|midday|evening")
+        if not args.rest or args.rest[0] not in (*BUILD, "weekly"):
+            ap.error("gate needs morning|midday|evening|weekly")
         return gate(args.rest[0], args)
     if args.cmd == "status":
         return status_cmd()

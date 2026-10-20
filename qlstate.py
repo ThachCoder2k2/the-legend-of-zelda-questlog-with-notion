@@ -10,6 +10,7 @@ came from a Claude task or from report.py). Everything lives in the runs/ folder
   status.json                        today's progress for the menu-bar button
   mode                               "live" (local runner shows the cards) or "shadow" (Claude tasks do)
 """
+import fcntl
 import json
 import os
 import re
@@ -22,7 +23,10 @@ RUNS = os.path.join(HERE, "runs")
 
 TIMES = {"morning": (7, 30), "midday": (12, 0), "evening": (22, 0)}
 # A run only counts inside its window (hours; 28 = 04:00 the next day), so a late wake-up never shows a stale card.
-WINDOW = {"morning": (7.0, 12.0), "midday": (11.5, 22.0), "evening": (21.5, 28.0)}
+# The windows tile the day: a card never follows another within minutes. The Sunday evening report also ends at 22:30,
+# when the weekly reset starts moving quests, so it never reports numbers the reset has already changed.
+WEEKLY_AT = (22, 30)
+WINDOW = {"morning": (7.0, 11.5), "midday": (11.5, 21.5), "evening": (21.5, 28.0)}
 KINDS = ("morning", "midday", "evening", "weekly")
 
 
@@ -35,10 +39,14 @@ def scheduled_day(kind, now):
     h = now.hour + now.minute / 60
     a, b = WINDOW[kind]
     if a <= h < b:
-        return now.date()
-    if a <= h + 24 < b:
-        return now.date() - timedelta(days=1)
-    return None
+        T = now.date()
+    elif a <= h + 24 < b:
+        T = now.date() - timedelta(days=1)
+    else:
+        return None
+    if kind == "evening" and T.isoweekday() == 7 and now >= datetime(T.year, T.month, T.day, *WEEKLY_AT):
+        return None
+    return T
 
 
 def kind_for_now(now):
@@ -83,30 +91,59 @@ def mark(T, kind, how="shown"):
         f.write(now_local().isoformat(timespec="seconds"))
 
 
-def claim(T, kind, ttl=600):
-    """Take the right to build and show this card. False when another run holds it (or already did)."""
-    p = stamp(T, kind) + ".claim"
-    os.makedirs(RUNS, exist_ok=True)
-    for _ in range(2):
-        try:
-            fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            try:
-                if time.time() - os.path.getmtime(p) > ttl:
-                    os.remove(p)   # stale: the run that took it died
-                    continue
-            except OSError:
-                pass
-            return False
-        with os.fdopen(fd, "w") as f:
-            f.write(str(os.getpid()))
+def _claim_is_stale(p, ttl):
+    """The run that took the claim is gone (its pid is dead) or has had it for longer than `ttl` seconds."""
+    try:
+        age = time.time() - os.path.getmtime(p)
+        with open(p) as f:
+            pid = int((f.read() or "0").strip() or 0)
+    except (OSError, ValueError):
         return True
+    if age > ttl:
+        return True
+    if pid > 0:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True   # killed (Quit, a relaunch, bootout): it never got to release
+        except OSError:
+            pass          # alive, but not ours to signal
     return False
 
 
+def claim(T, kind, ttl=600):
+    """Take the right to build and show this card. False when another run holds it (or already did).
+    The check and the takeover of a stale claim happen under flock, so of any number of simultaneous callers
+    exactly one wins."""
+    p = stamp(T, kind) + ".claim"
+    os.makedirs(RUNS, exist_ok=True)
+    with open(p + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.path.exists(p):
+            if not _claim_is_stale(p, ttl):
+                return False
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        with open(p, "w") as f:
+            f.write(str(os.getpid()))
+        return True
+
+
+def err_stamp(now=None):
+    """One "the card could not be built" notice per day, whichever kind hit the error."""
+    return os.path.join(RUNS, f"{(now or now_local()).date()}.errshown")
+
+
 def release(T, kind):
+    """Drop our own claim only: a run that outlived its ttl must not delete the claim of the run that replaced it."""
+    p = stamp(T, kind) + ".claim"
     try:
-        os.remove(stamp(T, kind) + ".claim")
+        with open(p) as f:
+            if f.read().strip() != str(os.getpid()):
+                return
+        os.remove(p)
     except OSError:
         pass
 
@@ -146,6 +183,28 @@ def idle_seconds():
         return int(m.group(1)) / 1e9 if m else 0.0
     except Exception:
         return 0.0   # unknown: assume the user is there
+
+
+def console_locked():
+    """True while the screen is locked (the login window is up): nobody can see a card."""
+    try:
+        out = subprocess.run(["/usr/sbin/ioreg", "-n", "Root", "-d1", "-a"], capture_output=True, text=True, timeout=10).stdout
+        return bool(re.search(r"<key>IOConsoleLocked</key>\s*<true/>", out))
+    except Exception:
+        return False
+
+
+def user_present():
+    """At the Mac: input in the last 10 minutes and the screen not locked. A dark wake (Power Nap) at 07:31 is not presence."""
+    return idle_seconds() <= 600 and not console_locked()
+
+
+def touch_claim(T, kind):
+    """Keep a long build's claim from expiring (a retrying scheduled run can take minutes)."""
+    try:
+        os.utime(stamp(T, kind) + ".claim", None)
+    except OSError:
+        pass
 
 
 def card_open():

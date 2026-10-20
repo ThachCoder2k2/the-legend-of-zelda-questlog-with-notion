@@ -74,7 +74,8 @@ def main(argv):
         cutoff = (now - timedelta(days=KEEP_DAYS)).isoformat()
         ledger = [e for e in read_json(LEDGER, "applied") if str(e.get("applied_at", "")) >= cutoff]
         ledger += [dict({"id": a["id"], "status": a.get("status"), "at": a.get("at", ""), "applied_at": now.isoformat()},
-                        **({"date": a["date"]} if a.get("date") else {})) for a in gone]
+                        **({"date": a["date"]} if a.get("date") else {}), **({"title": a["title"]} if a.get("title") else {}))
+                   for a in gone]
         write_json(LEDGER, {"version": 1, "applied": ledger})
         write_json(QUEUE, {"version": 1, "actions": kept})
         print(f"removed {len(gone)}, {len(kept)} left")

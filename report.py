@@ -566,7 +566,9 @@ def clear_day(r, ledger):
 
 
 def moved_by_card(ledger, ids, T):
-    """id -> day, for quests whose latest card click today was "Move" to a later day."""
+    """id -> day, for quests whose latest card click (any status) was today and was "Move to tomorrow": status To Do and a
+    date of exactly T + 1. A later Undo or Clear is a newer entry and cancels it; a move to any other day (a next-week
+    quest moved from the Sunday card) is not a move out of today."""
     by_id = {}
     for e in ledger:
         if e.get("id") in ids:
@@ -574,7 +576,7 @@ def moved_by_card(ledger, ids, T):
     out = {}
     for i, es in by_id.items():
         e = latest(es)
-        if local_day(e.get("at")) == T and e.get("status") == TODO and day(e.get("date")) and day(e["date"]) > T:
+        if local_day(e.get("at")) == T and e.get("status") == TODO and day(e.get("date")) == T + timedelta(days=1):
             out[i] = day(e["date"])
     return out
 
@@ -587,13 +589,17 @@ def build_evening(data, T, ledger):
     A = [r for r in week if day(r["date"]) == T]
     a_ids = {r["id"] for r in A}
     E = [r for r in rows if r["status"] == CLEARED and r["id"] not in a_ids and clear_day(r, ledger) == T]
-    today = A + E
+    e_ids = {r["id"] for r in E}
+    moved = moved_by_card(ledger, {r["id"] for r in rows}, T)
+    M = [r for r in rows if r["id"] in moved and r["id"] not in a_ids and r["id"] not in e_ids]   # on today's plan, moved out by the card
+    moved = {i: d for i, d in moved.items() if i in {r["id"] for r in M}}
+    today = A + E + M
     X, Y = sum(r["status"] == CLEARED for r in A) + len(E), len(today)
     main_ok = any(r["type"] == MAIN and r["status"] == CLEARED and clear_day(r, ledger) == T for r in rows)
     delayed = [r for r in week if r["status"] == DELAY]
-    moved = moved_by_card(ledger, {r["id"] for r in rows}, T)
     unfinished = [r for r in week if day(r["date"]) <= T and r["status"] not in (CLEARED, DELAY)]
-    mains = {r["date"] for r in week if r["type"] == MAIN and r["status"] == CLEARED}
+    # a Main cleared today counts once, for today: never also for its own (earlier) Date
+    mains = {r["date"] for r in week if r["type"] == MAIN and r["status"] == CLEARED and clear_day(r, ledger) != T}
     streak, d = (1 if main_ok else 0), T - timedelta(days=1)
     while d.isoformat() in mains:
         streak, d = streak + 1, d - timedelta(days=1)
@@ -1104,7 +1110,10 @@ def compare_cmd(rest, args):
 def check():
     token = read_token()
     if not token:
-        print('No token: run  security add-generic-password -s "QuestLog Notion" -a token -w')
+        have = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", "QuestLog Notion", "-a", "token"],
+                              capture_output=True).returncode == 0
+        print("The Keychain item exists but its token is empty (the paste didn't take). Save it again:" if have else "No token. Save it:")
+        print('  security add-generic-password -U -s "QuestLog Notion" -a token -w')
         return 1
     print("token: found in the Keychain")
     try:

@@ -3,6 +3,7 @@
 //   click          open the Quest Log card for the time of day (live from Notion, or the last saved card offline)
 //   right-click    menu: urgent deadlines, Add deadline…, Morning / Midday / Evening / Weekly, the Notion board, Quit
 //   ⌃⌥Q            the same as a click, from anywhere
+//   tracking       a quest you hit Track on (🔥 Grinding, from pending.json / applied.json) shows "▶ 12m" next to the icon
 //   ⌃⌥D            Add deadline…: one line ("Submit visa form, tomorrow 9am") becomes a quest with a Due in Notion
 //
 // The badge next to the icon is today's cleared/total (runs/status.json, written whenever a morning or evening card
@@ -62,6 +63,36 @@ func parseDue(_ raw: String) -> Date? {
     return Calendar(identifier: .gregorian).date(bySettingHour: 23, minute: 59, second: 0, of: day)
 }
 
+/// The quest you are tracking right now: the newest card click (queued or written) of each quest, if it is "Track" and
+/// recent. Only this Mac's clicks are known; a quest tracked elsewhere shows up once a card is shown.
+struct Tracking {
+    let id: String
+    let title: String
+    let since: Date
+
+    var minutes: Int { max(0, Int(Date().timeIntervalSince(since) / 60)) }
+    var elapsed: String { minutes < 60 ? "\(minutes)m" : "\(minutes / 60)h\(String(format: "%02d", minutes % 60))" }
+}
+
+func loadTracking() -> Tracking? {
+    var newest: [String: (at: Date, status: String)] = [:]
+    var titles: [String: String] = [:]
+    for (file, key) in [("applied.json", "applied"), ("pending.json", "actions")] {
+        guard let data = try? Data(contentsOf: folder.appendingPathComponent(file)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let list = obj[key] as? [[String: Any]] else { continue }
+        for e in list {
+            guard let id = e["id"] as? String, let status = e["status"] as? String,
+                  let raw = e["at"] as? String, let at = parseDue(raw) else { continue }
+            if let t = e["title"] as? String, !t.isEmpty { titles[id] = t }
+            if newest[id] == nil || at > newest[id]!.at { newest[id] = (at, status) }
+        }
+    }
+    let live = newest.filter { $0.value.status == "🔥 Grinding" && $0.value.at.timeIntervalSinceNow > -10 * 3600 }
+    guard let top = live.max(by: { $0.value.at < $1.value.at }) else { return nil }
+    return Tracking(id: top.key, title: titles[top.key] ?? "a quest", since: top.value.at)
+}
+
 final class Bar: NSObject, NSApplicationDelegate {
     var item: NSStatusItem!
     var menu = NSMenu()
@@ -75,6 +106,7 @@ final class Bar: NSObject, NSApplicationDelegate {
     var flash: (text: String, until: Date)?   // a short confirmation next to the icon ("✓ added")
     var addHotKey: EventHotKeyRef?
     var addOpen = false            // the Add deadline box is on screen
+    var tracking: Tracking?        // the quest being tracked, if any
     var retryText = ""              // what was typed when the line wasn't understood: put back in the box
     var tooltipNote = ""            // what the last add said, until the next refresh of the tooltip
     var lastOpen = Date.distantPast
@@ -177,6 +209,13 @@ final class Bar: NSObject, NSApplicationDelegate {
             menu.addItem(m)
         }
         if urgent.contains(where: { $0.level() > 0 }) { menu.addItem(.separator()) }
+        if let t = tracking {
+            let m = NSMenuItem(title: "▶  Tracking: \(t.title) · \(t.elapsed)", action: #selector(openUrgent(_:)), keyEquivalent: "")
+            m.target = self
+            m.representedObject = "https://app.notion.com/p/" + t.id
+            menu.addItem(m)
+            menu.addItem(.separator())
+        }
         if !notionOK {
             let m = NSMenuItem(title: "⚠  Notion isn't connected: set it up…", action: #selector(openSetup), keyEquivalent: "")
             m.target = self
@@ -221,6 +260,11 @@ final class Bar: NSObject, NSApplicationDelegate {
             let asOf = (obj["updatedAt"] as? String).flatMap { hourMinute($0) }.map { " as of \($0)" } ?? ""
             tip = "Quest Log: \(done) of \(total) quests cleared\(asOf) · click to open"
         }
+        tracking = loadTracking()
+        if let t = tracking {
+            text = " ▶ " + t.elapsed
+            tip = "Tracking: \(t.title) · \(t.elapsed) · click to open the card"
+        }
         if !running.isEmpty { text = " …" }   // a click is being served (building the card can take a few seconds)
         checkToken()
         if !notionOK {
@@ -237,7 +281,7 @@ final class Bar: NSObject, NSApplicationDelegate {
             let more = urgent.filter { $0.level() > 0 }.count - 1
             tip = "! \(first.title): \(first.countdown())" + (more > 0 ? " (+\(more) more)" : "") + " · click to open"
         }
-        let key = "\(text == " ✓")-\(worst)-\(worst >= 3 ? pulse : true)-\(notionOK)"
+        let key = "\(text == " ✓")-\(worst)-\(worst >= 3 ? pulse : true)-\(notionOK)-\(tracking?.id ?? "")"
         if key != lastIconKey {   // redraw only when something changed
             lastIconKey = key
             item.button?.image = icon(done: text == " ✓", level: worst, pulse: pulse)
@@ -264,19 +308,22 @@ final class Bar: NSObject, NSApplicationDelegate {
         urgent = items.sorted { $0.due < $1.due }
     }
 
-    /// Is the Notion token saved? Asks `security` for the item's attributes only (never the secret), at most once a minute.
+    /// Is a Notion token saved (and not empty: an empty paste leaves an empty Keychain item)? Asks `security`, at most once a
+    /// minute; the secret is only measured here, never kept, logged or sent anywhere.
     func checkToken() {
         guard Date().timeIntervalSince(lastTokenCheck) >= 60 else { return }
         lastTokenCheck = Date()
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        p.arguments = ["find-generic-password", "-s", "QuestLog Notion", "-a", "token"]
-        p.standardOutput = FileHandle.nullDevice
+        p.arguments = ["find-generic-password", "-s", "QuestLog Notion", "-a", "token", "-w"]
+        let out = Pipe()
+        p.standardOutput = out
         p.standardError = FileHandle.nullDevice
         do {
             try p.run()
+            let length = out.fileHandleForReading.readDataToEndOfFile().count
             p.waitUntilExit()
-            notionOK = p.terminationStatus == 0
+            notionOK = p.terminationStatus == 0 && length > 20
         } catch {
             notionOK = true   // can't tell: don't nag
         }

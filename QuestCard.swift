@@ -471,6 +471,7 @@ final class CardController: NSObject, NSApplicationDelegate, WKScriptMessageHand
         }
         var entry: [String: Any] = ["id": change.id, "status": change.status, "at": change.at, "applied_at": f.string(from: now), "via": "card"]
         if let date = change.date { entry["date"] = date }
+        if !change.title.isEmpty { entry["title"] = change.title }
         ledger.append(entry)
         if let data = try? JSONSerialization.data(withJSONObject: ["version": 1, "applied": ledger], options: [.prettyPrinted]) {
             try? data.write(to: url, options: .atomic)

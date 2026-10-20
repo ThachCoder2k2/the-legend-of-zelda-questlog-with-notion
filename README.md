@@ -43,6 +43,11 @@ questlog-weekly-reset.
   "Saved 22:11". Right-click: Morning / Midday / Evening / Weekly (last one) / the board / Quit. Every card ever shown is
   saved in `runs/last-KIND.json`, so the button also works offline. A manual open never marks a slot as shown, except when it opens a card that was due and unseen:
   then that card counts as shown. `report.py KIND --today DATE` (a preview of another day) saves nothing.
+- **Tracking timer:** the quest you hit Track on (🔥 Grinding) shows as "▶ 12m" next to the icon (the tooltip and the menu's top item
+  name it; the menu item opens it in Notion). It reads this Mac's card clicks (`pending.json`, `applied.json`) and drops out when you
+  clear, untrack or move the quest, or after 10 hours.
+- **Missing or empty token:** while there is no usable token the icon carries a "⚠" and the menu starts with "⚠ Notion isn't connected:
+  set it up…" (a paste that didn't take leaves an empty Keychain item, which counts as missing).
 - **The "!" badge:** `runs/urgent.json` = `{"items": [{"title", "due" (ISO date-time or YYYY-MM-DD), "url"}]}` puts an
   orange "!" on the icon: amber under 24 h, orange under 3 h, red and blinking under 1 h or overdue (the ring turns coral);
   the right-click menu lists those quests with a countdown and opens them. Levels come from the clock, so they work offline.
@@ -166,6 +171,8 @@ if Notion can't be read the card says why instead of staying silent. Cards and l
 Known differences from the Claude tasks:
 - "Wrap shell commands in backticks" is judgement in the prompts; `report.py` wraps commands it recognises
   (git, npm, python3, head, … with their arguments, e.g. `git status --short | head -40`).
+- The evening card follows the prompt's rules for the day's numbers: quests moved to tomorrow with the card stay in Today and in
+  the X/Y count (tag "→ moved to Wed 21/10"), a Main cleared today counts once for the streak, never also for its own earlier day.
 - The API returns 2-Min Start without the connector's Markdown escapes (`~31 min`, not `\~31 min`).
 - 1 quest reads "1 quest to do" / "1 quest left" instead of "1 quests".
 - The evening "cleared today" count also sees undated quests cleared today, which the connector's views can't show.

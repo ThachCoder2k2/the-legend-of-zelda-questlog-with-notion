@@ -76,6 +76,15 @@ Rules: each step shows once; a quest you track (🔥 Grinding) keeps the steps b
 disappears at once; alerts wait until you are at the Mac, and only the 15-minute and overdue steps may replace a card that is open;
 the routine time windows do not apply. Several deadlines in one step come as one card.
 
+**Phone push (ntfy.sh, off until you enable it).** While you are away from the Mac (no input for 10 minutes, or the screen locked) and
+the Mac is awake, the 1 h, 15 min and overdue steps go to your phone instead of waiting for a card: one notification per step
+(overdue: again every hour, three times at most), never the 3 h heads-up, never while you are at the Mac, never while snoozed.
+Setup: `python3 urgent.py push setup` makes `push.json` (private, not in git) with a random topic; install the ntfy app, subscribe to
+that topic; `push sample` shows exactly what would be sent; `push enable | disable | status | test`. What leaves the Mac: the
+notification (title "Quest Log · Last call", the quest title, its due time and countdown, a link to its Notion page) to
+https://ntfy.sh, addressed to your topic. Anyone who knows the topic can read it, so treat it like a password. Set `"titles": false`
+in push.json to send only "A deadline · Today 17:00 · in 14 min" with no title and no link. A sleeping Mac sends nothing.
+
 **Add deadline…** (right-click the button, or **⌃⌥D** anywhere): type one line and it becomes a 🧩 Side Quest in Notion with its
 Due, planned on the day it is due, and goes on the deadline list at once (`report.py add`, parsed by `quickadd.py`):
 `Submit visa form, tomorrow 9am` · `Pay rent in 3h` · `Report, fri 17:00` · `Call the bank, 26/10 10:30` · `Renew passport 2026-11-05`

@@ -15,6 +15,12 @@ Python 3.9+ standard library only.
                                      minute while a deadline is within 3 h; the catch-up agent every 10 minutes)
   python3 urgent.py snooze [MIN]     hold the alerts for MIN minutes (default 15); the card's Snooze button runs this
   python3 urgent.py clear            empty the list
+  python3 urgent.py push setup|sample|status|enable|disable|test
+                                     phone push through ntfy.sh while you are away from the Mac (off until `enable`)
+
+Phone push (push.json, next to this file; never in git): while you are away from the Mac (no input for 10 minutes, or the screen
+locked) and the Mac is awake, the 1 h, 15 min and overdue steps are sent to your phone through ntfy.sh instead of waiting for
+a card. It is off until `push enable`. Nothing is sent but the notification itself (see `push sample`).
 
 The ladder, by time left: 3 h heads-up (silent), 1 h (card + sound), 15 min (card + alert sound, again every 10 min),
 overdue (card + alert sound, again every 30 min). A step shows once; a quest you are tracking (🔥 Grinding) gets the
@@ -25,8 +31,11 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from datetime import date, datetime, timedelta
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -46,6 +55,11 @@ KEEP_OVERDUE = 3 * 86400            # a deadline missed by more than 3 days stop
 STAGE_AT = ((3 * 3600, 1), (3600, 2), (900, 3), (0, 4))   # seconds left -> step of the ladder
 REPEAT = {3: 600, 4: 1800}          # steps that come back until you act
 SNOOZE_MIN = 15
+PUSH_FILE = os.path.join(HERE, "push.json")
+PUSH_PRIORITY = {2: 3, 3: 4, 4: 5}          # ntfy: 3 default, 4 high, 5 max
+PUSH_TAGS = {2: ["alarm_clock"], 3: ["warning"], 4: ["rotating_light"]}
+PUSH_OVERDUE_EVERY = 3600                    # an overdue quest is pushed again every hour, at most PUSH_OVERDUE_MAX times in all
+PUSH_OVERDUE_MAX = 3
 EYEBROW = {1: "Heads-up", 2: "Deadline soon", 3: "Last call", 4: "Overdue"}
 SOUND = {1: "", 2: "open", 3: "alert", 4: "alert"}
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -248,6 +262,131 @@ def _save_state(s):
     qlstate._write_atomic(STATE, json.dumps(s, ensure_ascii=False, indent=1))
 
 
+# ---------------------------------------------------------------- phone push (ntfy.sh)
+
+def push_config():
+    """The settings when push is on and usable, else None."""
+    try:
+        with open(PUSH_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cfg, dict) or not cfg.get("enabled"):
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,80}", str(cfg.get("topic", ""))):
+        return None
+    server = str(cfg.get("server") or "https://ntfy.sh").rstrip("/")
+    if not server.startswith("https://"):
+        return None
+    return dict(cfg, server=server)
+
+
+def push_payload(cfg, alerts, now):
+    """The JSON that is sent for these alerts (the soonest, most urgent one leads; one notification per tick)."""
+    alerts = sorted(alerts, key=lambda a: (-a[1], a[0]["due"]))
+    lead, step = alerts[0]
+    lines = []
+    for it, _ in sorted(alerts, key=lambda a: a[0]["due"])[:4]:
+        d = parse_due(it["due"])
+        what = it["title"] if cfg.get("titles", True) else "A deadline"
+        lines.append(f"{what} · {due_label(d, now)} · {left_text((d - now).total_seconds())}")
+    if len(alerts) > 4:
+        lines.append(f"+{len(alerts) - 4} more")
+    body = {"topic": cfg["topic"], "title": "Quest Log · " + EYEBROW[step], "message": "\n".join(lines),
+            "priority": PUSH_PRIORITY[step], "tags": PUSH_TAGS[step]}
+    if cfg.get("titles", True) and lead.get("url"):
+        body["click"] = lead["url"]   # tapping it opens the quest in Notion
+    return body
+
+
+def push_send(cfg, body):
+    """POST the notification. True when ntfy accepted it; never raises (a push problem must not stop the card logic)."""
+    req = urllib.request.Request(cfg["server"] + "/", data=json.dumps(body, ensure_ascii=False).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json; charset=utf-8"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return 200 <= r.status < 300
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        log(f"push failed: {getattr(e, 'reason', e)}")
+        return False
+
+
+def push_away(alerts, state, now):
+    """You are away: push the 1 h / 15 min / overdue steps that have not been pushed. Records them in state["push"]."""
+    cfg = push_config()
+    if not cfg:
+        return False
+    sent = state.setdefault("push", {})
+    fresh = []
+    for it, s in alerts:
+        if s < 2:
+            continue
+        rec = sent.get(it["id"])
+        if rec and rec.get("due") != it["due"]:
+            rec = None   # the deadline was edited: start again
+        if rec is None or s > rec.get("stage", 0):
+            fresh.append((it, s))
+        elif s == 4 and rec.get("n", 1) < PUSH_OVERDUE_MAX and now.timestamp() - rec.get("at", 0) >= PUSH_OVERDUE_EVERY:
+            fresh.append((it, s))
+    if not fresh:
+        return False
+    if not push_send(cfg, push_payload(cfg, fresh, now)):
+        return False
+    for it, s in fresh:
+        old = sent.get(it["id"]) or {}
+        again = old.get("due") == it["due"] and old.get("stage") == s
+        sent[it["id"]] = {"due": it["due"], "stage": s, "at": now.timestamp(), "n": (old.get("n", 1) + 1) if again else 1}
+    log("pushed to your phone: " + ", ".join(it["title"] for it, _ in fresh))
+    return True
+
+
+def push_cmd(args):
+    sub = args[0] if args else "status"
+    cfg = None
+    try:
+        with open(PUSH_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        pass
+    if sub == "setup":
+        if cfg and cfg.get("topic"):
+            print("push.json already has a topic; use `push status`.")
+            return 0
+        topic = "questlog-" + re.sub(r"[^A-Za-z0-9]", "", secrets.token_urlsafe(24))[:24]
+        cfg = {"enabled": False, "topic": topic, "server": "https://ntfy.sh", "titles": True}
+        qlstate._write_atomic(PUSH_FILE, json.dumps(cfg, indent=1))
+        os.chmod(PUSH_FILE, 0o600)
+        print(f"topic: {topic}\nserver: https://ntfy.sh\nstate: OFF (nothing is sent until `push enable`)")
+        return 0
+    if not cfg or not cfg.get("topic"):
+        print("run `urgent.py push setup` first", file=sys.stderr)
+        return 2
+    if sub == "status":
+        print(f"{'ON' if cfg.get('enabled') else 'OFF'} · server {cfg.get('server', 'https://ntfy.sh')} · topic {cfg['topic']} · "
+              f"quest titles {'included' if cfg.get('titles', True) else 'left out'}")
+        return 0
+    if sub in ("enable", "disable"):
+        cfg["enabled"] = sub == "enable"
+        qlstate._write_atomic(PUSH_FILE, json.dumps(cfg, indent=1))
+        print("push is now " + ("ON" if cfg["enabled"] else "OFF"))
+        return 0
+    if sub == "sample":   # what would be sent, for a made-up quest; no network
+        now = now_aware()
+        it = {"id": "a" * 32, "title": "Submit visa form", "due": (now + timedelta(minutes=14)).isoformat(timespec="seconds"),
+              "url": PAGE + "a" * 32}
+        shown = dict(cfg, enabled=True, topic="<your topic>")
+        print("POST " + cfg.get("server", "https://ntfy.sh") + "/   (JSON)")
+        print(json.dumps(push_payload(shown, [(it, 3)], now), ensure_ascii=False, indent=1))
+        return 0
+    if sub == "test":
+        ok = push_send(dict(cfg, server=str(cfg.get("server") or "https://ntfy.sh").rstrip("/")),
+                       {"topic": cfg["topic"], "title": "Quest Log · test", "message": "Phone push works.", "tags": ["white_check_mark"]})
+        print("sent" if ok else "not sent")
+        return 0 if ok else 1
+    print("usage: urgent.py push setup|sample|status|enable|disable|test", file=sys.stderr)
+    return 2
+
+
 def tick(now=None, force=False, dry=False, presence=None):
     """Show the urgent card if a step of the ladder is due. 0 = nothing wrong (including "nothing to show")."""
     now = now or now_aware()
@@ -271,6 +410,8 @@ def tick(now=None, force=False, dry=False, presence=None):
         if not force:
             here = qlstate.user_present() if presence is None else presence
             if not here:
+                if push_away(alerts, state, now):
+                    _save_state(state)
                 log(f"step {step} is due; waiting until you are back at the Mac")
                 return 0
             if step < 3 and qlstate.card_open():
@@ -339,6 +480,8 @@ def main(argv):
         until = snooze(max(1, min(minutes, 24 * 60)))
         print(f"snoozed until {datetime.fromtimestamp(until):%H:%M}")
         return 0
+    if cmd == "push":
+        return push_cmd(argv[2:])
     if cmd == "clear" and len(argv) == 2:
         save([])
         return 0

@@ -14,3 +14,5 @@ sounds/custom/*
 questbar
 # runtime state of the runner (stamps, last cards, logs)
 runs/
+# phone push settings (holds the private topic)
+push.json

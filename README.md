@@ -1,244 +1,295 @@
-# Quest Log cards
+# Quest Log
 
-Pop-up report cards for the Notion board "Quest Log", used by the scheduled tasks
-questlog-morning-report, questlog-evening-reminder (12:00), questlog-evening-report and
-questlog-weekly-reset.
+A daily planner for macOS that looks like a game's quest menu. Your quests live in a Notion database; the Mac pops up a
+card in the morning, at midday and in the evening, and you clear, track or postpone quests right on the card.
+Every click is saved to Notion within seconds.
 
-- `card.html`: the design (Zelda: Tears of the Kingdom-style menu card: Purah Pad black,
-  cyan italic text, sliding gold cursor, stamina-wheel progress, item description pane; CSS/SVG only).
-  Preview in a browser with `?kind=morning|midday|evening|weekly` to see sample data.
-- `QuestCard.swift` → `questcard`: opens card.html in a floating panel (top-right of the screen
-  under the mouse). Rebuild: `swiftc -O QuestCard.swift -o questcard -framework Cocoa -framework WebKit`
-- `show_card.py`: `python3 show_card.py card.json` launches the card detached; falls back to
-  a plain AppleScript dialog if `questcard` is missing.
-- `pending.py`: queue of quest status changes clicked on the card (`pending.json`), applied by
-  the next scheduled task (`list`, `done ID AT`, `applied`).
-- `report.py`: builds the morning / midday / evening cards straight from the Notion API, without Claude
-  (see "Local runner" below).
-- `make_sounds.py` → `sounds/*.wav`: original synthesized menu sounds (open, move, scroll, select,
-  done, undo, cancel, track, untrack, close, alert). Edit and re-run to change them; `"sound": ""` in the card JSON mutes the card.
-  Your own files in `sounds/custom/` (same names, .wav/.aiff/.caf/.m4a/.mp3) replace the built-in ones.
+Made for an ADHD-friendly routine: one ⭐ Main quest a day, at least one 🎮 Fun quest, a "2-minute start" for every
+quest, and nothing to remember: the cards come to you.
 
-## When the Mac was asleep, off or away (catch-up) and the button
+![Evening report, full screen](docs/screenshots/evening-full.jpg)
 
-- **Sleep:** launchd runs a job that was due during sleep as soon as the Mac wakes up (that is why 07:30 can show at 08:16).
-  A wake-up on the lock screen (or a dark wake / Power Nap) is not you being there, so the card waits; `questbar` runs the
-  catch-up again 5 s after a wake-up and after you unlock, so it appears at once instead of at the next 10-minute tick.
-- **Powered off:** launchd skips those jobs, so `com.questlog.catchup` also runs at login and every 10 minutes. It shows
-  the one card that is due and unseen, **only once you are back at the Mac** (keyboard or mouse used in the last 10 minutes)
-  and **never on top of a card that is open**. A card only counts inside its window: morning 07:00–11:30, midday
-  11:30–21:30, evening 21:30–04:00 (the evening report after midnight is still for the previous day). The windows tile the
-  day, so a late start shows one card, never a stack and never two within minutes. On Sundays the evening window closes at
-  22:30, when the weekly reset starts moving quests, so the report never shows numbers the reset already changed. The weekly
-  reset has its own catch-up (the Monday–Saturday check in its prompt) and waits for the Sunday evening report (`gate weekly`).
-- **Live vs shadow** (`python3 report.py status`): *shadow* (default) = the Claude tasks show the cards and the local runner
-  only logs; *live* (`python3 report.py install --live`, needs the Notion token: `report.py check`) = the local runner
-  shows them, even with the Claude app closed, and the Claude tasks stop themselves at their "late guard" step.
-  Without the token the catch-up can't build a card, so it shows one small notice per day (any kind) and keeps retrying quietly.
-- **Late guard:** the three daily Claude prompts start with `report.py gate KIND`: it says "skip" outside the window, when
-  the card was already shown, or when the local runner is live; otherwise "go DATE".
-- **The button:** `questbar` puts the game's gold quest marker in the menu bar (mint once today is cleared; the number is
-  today's cleared/total, as of the last card shown, hover for the time). Click, or **⌃⌥Q** anywhere = open
-  the card now (`report.py now`): live from Notion, or, when Notion can't be reached, the last saved card labelled
-  "Saved 22:11". Right-click: Morning / Midday / Evening / Weekly (last one) / the board / Quit. Every card ever shown is
-  saved in `runs/last-KIND.json`, so the button also works offline. A manual open never marks a slot as shown, except when it opens a card that was due and unseen:
-  then that card counts as shown. `report.py KIND --today DATE` (a preview of another day) saves nothing.
-- **Status actions in the menu:** right-click lists today's open quests (from `runs/today.json`, which every card you are shown
-  refreshes: the morning / midday list, or the evening card's plan for tomorrow). Each has a submenu: ✓ Clear · ▶ Track (start
-  now; one tracked quest at a time) · → Move to tomorrow · Open in Notion; the tracked quest sits on top with ■ Stop tracking.
-  A choice is queued in `pending.json` exactly like a card click and, when the token is saved, written to Notion at once
-  (`report.py apply`); without a token the next scheduled Claude task applies it. Cleared and moved quests leave the list.
-- **Tracking timer:** the quest you hit Track on (🔥 Grinding) shows as "▶ 12m" next to the icon (the tooltip and the menu's top item
-  name it; the menu item opens it in Notion). It reads this Mac's card clicks (`pending.json`, `applied.json`) and drops out when you
-  clear, untrack or move the quest, or after 10 hours.
-- **Missing or empty token:** while there is no usable token the icon carries a "⚠" and the menu starts with "⚠ Notion isn't connected:
-  set it up…" (a paste that didn't take leaves an empty Keychain item, which counts as missing).
-- **The "!" badge:** `runs/urgent.json` = `{"items": [{"title", "due" (ISO date-time or YYYY-MM-DD), "url"}]}` puts an
-  orange "!" on the icon: amber under 24 h, orange under 3 h, red and blinking under 1 h or overdue (the ring turns coral);
-  the right-click menu lists those quests with a countdown and opens them. Levels come from the clock, so they work offline.
-  Filled from the Quests "Due" property (see "Deadlines" below).
-- A saved card shown the next day relabels its days ("Yesterday · Mon 19/10", "Today · Tue 20/10") instead of saying "Tomorrow" for today.
-- Files: `quickadd.py` (the "Add deadline…" line), `set-notion-token.command` (token setup), `urgent.py` (deadlines and their escalation ladder), `qlstate.py` (windows, stamps, claim locks, saved cards, mode), `QuestBar.swift` → `questbar`
-  (`swiftc -O QuestBar.swift -o questbar -framework Cocoa -framework Carbon`), logs in `runs/`.
-  `report.py install` loads: the three daily agents, `com.questlog.catchup`, `com.questlog.bar`; `uninstall` removes them.
-  A true desktop widget (WidgetKit) would need a signed app extension built in Xcode; the menu-bar button covers the same use.
+<p align="center">
+  <img src="docs/screenshots/morning-compact.jpg" width="330" alt="Morning briefing as the corner card">
+  &nbsp;&nbsp;
+  <img src="docs/screenshots/urgent-compact.jpg" width="330" alt="Deadline alert card">
+</p>
 
-## Deadlines
+<sub>Screenshots use made-up sample quests.</sub>
 
-Give a quest a **Due** (date + time) in Notion (a date without a time means 23:59). Open quests that have one appear in the
-board view **⏰ Deadlines**, on the cards as a "Due Today 17:00" tag, on the menu-bar icon as the "!" badge, and they climb a ladder
-of urgent cards (`urgent.py`):
+## What it does
 
-| time left | what happens |
-|---|---|
-| 3 h | amber/orange badge, one silent compact card |
-| 1 h | red blinking badge, card with the open sound |
-| 15 min | card with the alert sound, again every 10 min until you act |
-| overdue | card with the alert sound, again every 30 min (stops 3 days after the deadline) |
+- **Three cards a day**: 07:30 morning briefing (today's quests), 12:00 midday check (what is left), 22:00 evening
+  report (cleared count, ⭐ done or not, day streak, tomorrow's plan).
+- **Act on the card**: Clear, Track (🔥 in progress), Move to tomorrow, Undo, Open in Notion, with the keyboard or the mouse.
+- **Detail panel** for each quest: illustration, questline goal, next 2-minute step, questline log.
+- **Menu-bar button**: opens the card any time (⌃⌥Q), lists today's quests with quick actions, shows a tracking timer.
+- **Deadlines**: give a quest a Due time and it climbs a ladder of reminders (badge → card → alert sound), with an
+  optional push to your phone while you are away.
+- **Works offline**: a click that can't reach Notion waits in a local queue and is sent as soon as the network is back.
+- **No AI needed day to day**: everything above runs on the Mac. An AI assistant (Claude) is optional and only plans
+  the coming week.
 
-The urgent card is red, compact, with **Start** (T, tracks the quest), **Done** (D), **Snooze** (S, 15 minutes) and Details / Close.
-Rules: each step shows once; a quest you track (🔥 Grinding) keeps the steps but loses the repeats; a quest you clear on a card
-disappears at once; alerts wait until you are at the Mac, and only the 15-minute and overdue steps may replace a card that is open;
-the routine time windows do not apply. Several deadlines in one step come as one card.
+## How it works
 
-**Phone push (ntfy.sh, off until you enable it).** While you are away from the Mac (no input for 10 minutes, or the screen locked) and
-the Mac is awake, the 1 h, 15 min and overdue steps go to your phone instead of waiting for a card: one notification per step
-(overdue: again every hour, three times at most), never the 3 h heads-up, never while you are at the Mac, never while snoozed.
-Setup: `python3 urgent.py push setup` makes `push.json` (private, not in git) with a random topic; install the ntfy app, subscribe to
-that topic; `push sample` shows exactly what would be sent; `push enable | disable | status | test`. What leaves the Mac: the
-notification (title "Quest Log · Last call", the quest title, its due time and countdown, a link to its Notion page) to
-https://ntfy.sh, addressed to your topic. Anyone who knows the topic can read it, so treat it like a password. Set `"titles": false`
-in push.json to send only "A deadline · Today 17:00 · in 14 min" with no title and no link. A sleeping Mac sends nothing.
+```mermaid
+flowchart LR
+    N[("Notion<br/>Quests + Questlines")]
+    R["report.py<br/>launchd: 07:30 · 12:00 · 22:00<br/>+ catch-up every 10 min"]
+    C["Quest card<br/>questcard + card.html"]
+    B["Menu-bar button<br/>questbar"]
+    Q["pending.json<br/>(local queue)"]
+    AI["Claude (optional)<br/>weekly plan"]
+    R -- reads --> N
+    R -- shows --> C
+    B -- opens --> C
+    C -- clicks --> N
+    B -- quick actions --> N
+    C -. offline .-> Q
+    Q -- retried --> N
+    AI -. plans the week .-> N
+```
 
-**Add deadline…** (right-click the button, or **⌃⌥D** anywhere): type one line and it becomes a 🧩 Side Quest in Notion with its
-Due, planned on the day it is due, and goes on the deadline list at once (`report.py add`, parsed by `quickadd.py`):
-`Submit visa form, tomorrow 9am` · `Pay rent in 3h` · `Report, fri 17:00` · `Call the bank, 26/10 10:30` · `Renew passport 2026-11-05`
-(a day without a time = until 23:59; a bare time = the next time the clock shows it; `17h` = 17:00, `3h` = in three hours).
-It needs the token with Insert content. If the line can't be read, the box comes back with your text.
+| part | file | job |
+|---|---|---|
+| Card | `card.html` (HTML/CSS/SVG) + `QuestCard.swift` → `questcard` | draws the card in a floating window, sends clicks to Notion |
+| Runner | `report.py` (Python 3, standard library only) | reads Notion, builds the cards, writes queued clicks, installs the schedule |
+| Menu bar | `QuestBar.swift` → `questbar` | the button, quick actions, tracking timer, deadline badge |
+| Queue | `pending.py` → `pending.json`, `applied.json` | clicks waiting for Notion, and a 14-day log of what was saved |
+| Deadlines | `urgent.py`, `quickadd.py` | reminder ladder, phone push, "Add deadline…" |
+| State | `qlstate.py`, `runs/` | which card was shown when, saved cards for offline use, logs |
+| Sounds | `make_sounds.py` → `sounds/*.wav` | original menu sounds, synthesized in Python |
 
-On the cards, **Move to tomorrow** says "· after its deadline" (and a toast) when the new day is later than the quest's Due.
-The weekly reset never moves a quest past its Due (rule 3-0 in its prompt: deadline quests are placed first, the day before
-the deadline when possible, and anything overdue or sharing a Main day is reported).
+## Requirements
 
-Where the list comes from (`runs/urgent.json`): `report.py refresh` (the catch-up agent runs it every 10 minutes, and every card the
-local runner builds refreshes it) needs the Notion token; without the token the three daily Claude tasks fill it through
-`urgent.py set` (step U of their prompts), so a deadline added at 14:00 is only noticed at the next daily card. `questbar` runs
-`report.py urgent` every minute while a deadline is within 3 hours (the catch-up agent also does, every 10 minutes).
-Commands: `python3 urgent.py list | tick [--force] [--dry-run] | snooze [MIN] | set (JSON on stdin) | clear`.
-Preview the card: `card.html?kind=urgent`.
+- macOS with the Xcode Command Line Tools (`xcode-select --install`) for `swiftc` and `/usr/bin/python3`.
+  Built and used on macOS 26 on Apple Silicon; other recent versions should work but are untested.
+- A Notion workspace with two databases laid out as in [Notion setup](#notion-setup).
+- A Notion integration token (free), see [Saving "done" to Notion](#saving-done-to-notion).
 
-## Tests
+## Setup
 
-`tests/run.sh` runs the whole suite (about 200 checks: time windows, catch-up, locks, deadlines, quick add, push, evening numbers…)
-in a throw-away sandbox: a temp copy of the scripts, a fake `questcard` and `osascript`, the network stubbed. It touches no real
-state and sends nothing to Notion or ntfy.sh. It needs only `/usr/bin/python3`.
+1. **Get the code** into a folder that will stay put (the schedule points at it), for example:
+   ```bash
+   git clone https://github.com/ThachCoder2k2/the-legend-of-zelda-questlog-with-notion.git ~/Library/Application\ Support/QuestLog
+   cd ~/Library/Application\ Support/QuestLog
+   ```
+2. **Build the two apps and the sounds:**
+   ```bash
+   swiftc -O QuestCard.swift -o questcard -framework Cocoa -framework WebKit
+   swiftc -O QuestBar.swift -o questbar -framework Cocoa -framework Carbon
+   python3 make_sounds.py
+   ```
+3. **Create the Notion databases** ([Notion setup](#notion-setup)) and put their IDs in the code:
+   `QUESTS_DB` and `QUESTLINES_DB` in `report.py`, and your board page in `boardURL` (`QuestCard.swift`, `QuestBar.swift`)
+   and `BOARD` (`show_card.py`). Rebuild after changing the Swift files.
+4. **Connect Notion** with an integration token: [Saving "done" to Notion](#saving-done-to-notion). Then check it:
+   ```bash
+   python3 report.py check
+   ```
+5. **Turn it on:**
+   ```bash
+   python3 report.py install --live
+   ```
+   This loads the LaunchAgents (07:30, 12:00, 22:00, the catch-up and the menu-bar button).
+   `python3 report.py status` shows what is installed; `python3 report.py uninstall` removes it all.
+6. **Try it:** click the button in the menu bar, or run `python3 report.py now`.
 
-## Full screen (default)
+Just want to look at the design? Open `card.html` in Safari with `?kind=morning`, `midday`, `evening`, `weekly` or
+`urgent` at the end of the address: it shows sample data and needs nothing else.
 
-The card opens full screen like the Purah Pad menu: tabs on top, quest list on the left, the detail panel
-(always shown, following the cursor) on the right, prompts bottom-right. **M** (or a click on the dimmed
-backdrop) shrinks it to the corner card; M again goes back. `"display": "compact"` in the card JSON opens it
-as the corner card instead.
+## Using it
 
-## Controls (TOTK Adventure Log style)
+**When cards appear**
+
+| card | time | shown if you are at the Mac between |
+|---|---|---|
+| Morning briefing | 07:30 | 07:00 and 11:30 |
+| Midday check | 12:00 | 11:30 and 21:30 |
+| Evening report | 22:00 | 21:30 and 04:00 (after midnight it is still the previous day's report) |
+
+If the Mac was asleep, off or you were away, the card shows once you are back, never stacked and never on top of an
+open card.
+
+**Controls**
 
 | input | action |
 |---|---|
-| hover, ↑ / ↓ (or j / k) | move the gold cursor; the pane below (and the detail panel, if open) follows |
-| click the slot at a quest's right end, T | **track** it (TOTK-style: one tracked quest at a time; tracked = 🔥 Grinding); again = untrack |
-| Space, the status chip in the detail panel | action menu: Clear · Track · Move to tomorrow · To do · Undo · Open in Notion |
-| double-click, Enter, → | detail panel beside the card (map preview, questline goal, next step, questline log) |
+| hover, ↑ / ↓ (or j / k) | move the gold cursor |
+| click the slot at a quest's right end, or T | track it (one tracked quest at a time); again = untrack |
+| Space | action menu: Clear · Track · Move to tomorrow · To do · Undo · Open in Notion |
+| Enter, →, double-click | detail panel |
 | Enter in the detail panel | open the quest in Notion |
-| B | open the board |
+| B | open the board in Notion |
 | M | full screen ⇄ corner card |
 | Esc | close the menu, then the detail panel, then the card |
-| drag the header | move the card |
-
-Each quest shows its questline's illustration (row tile + banner in the detail panel), drawn as original SVG in
-`card.html` (`ART`): Unbound Pawn, Konosuba, Play Cyberpunk, Master's Decision, AI Fintech, Economics, then
-Main / Side / Fun defaults. New questlines: add a banner, a tile and a name pattern to `ART`.
+| drag the header | move the corner card |
 
 Keys work only after you click the card once, so typing in another app never reaches it.
-"Move to tomorrow" sets the quest's Date to the next day and its Status to To Do.
+The card opens full screen; `"display": "compact"` in its data opens it as the corner card.
+
+**Menu-bar button**: click or ⌃⌥Q opens the card for the time of day (or the last saved one when offline).
+Right-click for today's quests (Clear · Track · Move to tomorrow · Open), the other cards, "Add deadline…" (⌃⌥D) and
+the board. Next to the icon: today's cleared/total, or "▶ 12m" while a quest is tracked, or "!" when a deadline is close.
+
+**Deadlines**: give a quest a **Due** date and time in Notion, or type one line in "Add deadline…", for example
+`Pay rent, fri 17:00` or `Call the bank in 3h`.
+
+| time left | what happens |
+|---|---|
+| 3 h | amber badge, one quiet card |
+| 1 h | red blinking badge, card with a sound |
+| 15 min | card with the alert sound, again every 10 min |
+| overdue | alert card again every 30 min (stops 3 days later) |
+
+The urgent card has **Start** (T), **Done** (D) and **Snooze 15 min** (S).
 
 ## Saving "done" to Notion
 
-With the Notion token saved (steps below), the Mac writes every click on the card or in the menu bar to Notion itself,
-within seconds: no Claude task is involved. A click that can't be written right away (offline, Notion down, the card
-closed first) waits in `pending.json`; the catch-up agent writes it at login, after a wake-up and every 10 minutes (in
-shadow and live mode alike), and until then the menu bar lists "⏳ N changes not in Notion yet: save now".
+The Mac needs its own key to Notion, an integration token. With it, every click on the card or in the menu bar is
+written to Notion within seconds. A click that can't be written right away (offline, Notion down) waits in
+`pending.json` and is retried at login, after a wake-up and every 10 minutes; until then the menu bar shows
+"⏳ N changes not in Notion yet: save now". Without a token, clicks only wait in the queue.
 
-Without the token a click only waits in `pending.json` (menu: "⚠ Notion isn't connected (N changes waiting)") until a
-Claude task (07:30, 12:00, 22:00, Sunday 22:30) applies it through the Notion connector, so with no Claude task running
-nothing changes in Notion. That is why the token matters:
+1. Open [notion.so/profile/integrations](https://www.notion.so/profile/integrations) → **New integration** (or New
+   connection) → type **Internal** / **API token**, pick your workspace, Save.
+2. **Capabilities**: Read content, Update content, Insert content ("Add deadline…" needs Insert).
+   User capabilities: No user information.
+3. **Content access** (or, on the page: ••• → Connections → Connect to): add the page that **contains the two
+   databases**. Connecting only a board page that shows them is not enough (every call would fail with 404).
+4. Copy the token, then right-click the menu-bar button → "⚠ Notion isn't connected: set it up…". A Terminal window
+   opens (`set-notion-token.command`): paste the token, press Return, paste it again, Return. Nothing shows while you
+   paste; that is normal. It is stored in the macOS Keychain (service `QuestLog Notion`, account `token`), never in a file.
 
-1. **Queued (no token):** written to `pending.json` (status, plus date for a move); the next scheduled Quest Log task
-   applies it through the Notion connector first thing.
-2. **Instant (token):** give the card its own Notion integration token.
-   1. Notion → Settings → Connections → Develop or manage integrations → New integration
-      (internal, your workspace, capabilities: Read, Update **and Insert** content; Insert is what "Add deadline…" needs). Copy the secret.
-   2. Open the page **🗂️ Quest Log Data** → ••• → Connections → add that integration. That page holds the
-      Quests and Questlines databases; it is a separate top-level page, so connecting only the Quest Log board
-      page is not enough (every call would fail with 404).
-   3. Right-click the menu-bar button, "⚠ Notion isn't connected: set it up…" (shown while the token is missing; it opens
-      `set-notion-token.command` in Terminal), or run yourself `security add-generic-password -U -s "QuestLog Notion" -a token -w`
-      (it asks for the secret; paste it there, so it never lands in shell history).
-   Remove it with `security delete-generic-password -s "QuestLog Notion" -a token`.
-   If Notion cannot be reached, the click falls back to the queue.
-   Test it with `python3 report.py check`.
+Check it with `python3 report.py check`. Remove it with `security delete-generic-password -s "QuestLog Notion" -a token`.
 
-## Local runner (no Claude needed)
+## Notion setup
 
-`report.py` makes the 07:30, 12:00 and 22:00 cards itself from the Notion API with the token above: a few
-seconds, no Claude tokens, and it works with the Claude app closed. It follows the prompts of
-questlog-morning-report, questlog-evening-reminder and questlog-evening-report (~/.claude/scheduled-tasks/…/SKILL.md)
-step by step, including step 0 (queued clicks are written to Notion and recorded in applied.json through
-`pending.py done`). The Sunday weekly reset stays a Claude task: it needs planning judgement.
+**Quests** database
 
-**Running without Claude.** Once the token works and `install --live` is done, Claude is only the weekly planner:
-saving clicks, the 07:30 / 12:00 / 22:00 cards, the catch-up after sleep, deadlines and the menu bar all run on the
-Mac. If the Sunday plan doesn't run, the week goes on: unfinished quests show up as carried ("↩︎") on the next
-morning card until you re-plan.
+| property | type | values |
+|---|---|---|
+| Quest | title | |
+| Type | select | `⭐ Main Quest`, `🧩 Side Quest`, `🎮 Fun` |
+| Status | status | `📜 To Do`, `🔥 Grinding`, `⏸ Delay`, `✅ Cleared` |
+| Date | date | the day it is planned for |
+| Energy | select | `🐸 Mobs` (light), `🐉 Boss` (heavy), `🔒 Locked` (ignored) |
+| 2-Min Start | text | the tiny first step, shown as "Next step" |
+| Questline | relation → Questlines | |
+| Due | date with time | optional deadline |
+| Edited | last edited time | |
+| On Today | formula (optional) | `"yes"` for quests on today's list; without it a built-in rule is used |
+
+**Questlines** database: `Questline` (title), `Done means` (text, shown as the questline goal), `Quests` (relation).
+
+Quests without a Date sit on a "Quest Board" backlog. Each questline can have its own illustration: add a banner, a
+tile and a name pattern to `ART` in `card.html`; other quests get the Main / Side / Fun default art.
+
+## Optional: Claude as the weekly planner
+
+Claude (Anthropic's AI assistant) can run as a scheduled task on Sunday evening: it reads the board, carries unfinished
+quests into next week, gives every day one ⭐ Main and at least one 🎮 Fun quest, and pops up the week as a card. It
+writes to Notion through its own Notion connector and applies any queued clicks first. The prompt is not part of this
+repository. Nothing else depends on it: if it doesn't run, unfinished quests simply show up as carried ("↩︎") on the
+next morning card.
+
+## Reference
+
+<details>
+<summary><b>report.py commands</b></summary>
 
 | command | does |
 |---|---|
-| `python3 report.py morning` (or `midday`, `evening`) | apply queued clicks, read Notion, show the card |
-| `… --dry-run` | print the card JSON only: no Notion writes, pending.json untouched, no card |
+| `python3 report.py morning` (or `midday`, `evening`) | write queued clicks, read Notion, show the card |
+| `… --dry-run` | print the card JSON only: no Notion writes, queue untouched, no card |
 | `… --today 2026-10-21` | build the card for another day |
-| `python3 report.py compare evening` | diff the Claude task's last card (`/tmp/questlog-evening-card.json`) against ours |
-| `python3 report.py install` / `install --live` / `uninstall` | LaunchAgents at 07:30, 12:00, 22:00 (`~/Library/LaunchAgents/com.questlog.report.*.plist`) |
+| `python3 report.py now [KIND]` | open a card now (what the menu-bar button runs) |
+| `python3 report.py apply` | write the queued clicks to Notion now |
+| `python3 report.py catchup` | what the 10-minute agent runs: send queued clicks, deadlines, a missed card |
+| `python3 report.py add -- "TITLE, WHEN"` | create a deadline quest |
+| `python3 report.py status` | mode, token, which cards were shown today, saved cards |
 | `python3 report.py check` | token, Notion access, row counts |
+| `python3 report.py install [--live]` / `uninstall` | LaunchAgents in `~/Library/LaunchAgents/com.questlog.*` |
+| `python3 report.py shadow KIND`, `compare KIND` | compare the cards with ones made by a Claude task (see below) |
 
-**Live since 29/10/2026** (the three Claude tasks morning, midday and evening are turned off). **Shadow mode** (the earlier trial setup): The LaunchAgents show nothing and write no cards' changes to Notion (the catch-up still writes queued clicks). Each one waits for
-the Claude task's card, builds ours at that moment and appends the result to `runs/compare.log`
-(differences in `runs/DATE-KIND.diff.txt`). Once a few days read `MATCH`, go live (first `touch runs/DATE-morning.shown runs/DATE-midday.shown` for the cards of
-today you already saw, or the catch-up shows them again):
-run `python3 report.py install --live`, then turn off the three Claude tasks (morning, midday, evening) in the
-Claude app so the card doesn't show twice. Undo: `python3 report.py install` (back to shadow) and turn them on again.
+`install` without `--live` installs **shadow mode**: the agents only build cards in the background and compare them
+with the cards a Claude task showed (`runs/compare.log`). It was used to check the local runner against Claude before
+switching over. Queued clicks are written in both modes.
+</details>
 
-Live runs: a run that fires after a wake-up only shows when it still makes sense (morning 07:00–12:00,
-midday 11:30–22:00, evening 21:30–04:00, after midnight as the previous day's report), each card once a day;
-if Notion can't be read the card says why instead of staying silent. Cards and logs: `runs/` (kept 30 days).
+<details>
+<summary><b>Catch-up after sleep, shutdown or time away</b></summary>
 
-Known differences from the Claude tasks:
-- "Wrap shell commands in backticks" is judgement in the prompts; `report.py` wraps commands it recognises
-  (git, npm, python3, head, … with their arguments, e.g. `git status --short | head -40`).
-- The evening card follows the prompt's rules for the day's numbers: quests moved to tomorrow with the card stay in Today and in
-  the X/Y count (tag "→ moved to Wed 21/10"), a Main cleared today counts once for the streak, never also for its own earlier day.
-- The API returns 2-Min Start without the connector's Markdown escapes (`~31 min`, not `\~31 min`).
-- 1 quest reads "1 quest to do" / "1 quest left" instead of "1 quests".
-- The evening "cleared today" count also sees undated quests cleared today, which the connector's views can't show.
-- If you edit a task prompt, `report.py` doesn't follow by itself: change it too (shadow mode will show the drift).
+- launchd runs a job that was due during sleep as soon as the Mac wakes; `questbar` also runs the catch-up 5 s after a
+  wake-up or an unlock.
+- `com.questlog.catchup` runs at login and every 10 minutes. It first writes queued clicks to Notion, then shows the one
+  card that is due and unseen, only once you are back (keyboard or mouse used in the last 10 minutes) and never on top
+  of an open card. A newer card covers older ones, so a late start shows one card, not three.
+- On Sundays the evening window ends at 22:30, when the weekly plan may start moving quests.
+- Every card shown is saved in `runs/last-KIND.json`, so the menu-bar button works offline; a saved card says when it
+  was made ("Saved 22:11").
+</details>
 
-## Card JSON
+<details>
+<summary><b>Phone push for deadlines (ntfy.sh, off by default)</b></summary>
+
+While you are away from the Mac (no input for 10 minutes, or the screen locked) and the Mac is awake, the 1 h, 15 min
+and overdue steps go to your phone through [ntfy.sh](https://ntfy.sh) instead of waiting for a card.
+
+```bash
+python3 urgent.py push setup     # makes push.json (private, not in git) with a random topic
+python3 urgent.py push sample    # shows exactly what would be sent
+python3 urgent.py push enable    # also: disable | status | test | newtopic
+```
+
+Install the ntfy app and subscribe to the topic. Anyone who knows the topic can read the notifications, so treat it
+like a password; set `"titles": false` in `push.json` to send no quest titles or links.
+</details>
+
+<details>
+<summary><b>Card data (JSON)</b></summary>
+
+`python3 show_card.py card.json` shows any card (it falls back to a plain dialog if `questcard` is missing).
 
 | field | type | notes |
 |---|---|---|
-| kind | "morning" \| "midday" \| "evening" \| "weekly" \| "urgent" | colour theme and header icon (urgent = the deadline card: compact only, with Start / Done / Snooze) |
-| badge | emoji | unused by the TOTK design (icon comes from kind) |
-| eyebrow | string | small line above the title |
-| title | string | |
-| subtitle | string | optional |
-| progress | {done, total} | optional stamina wheel; morning/evening count the first section live |
-| stats | [{icon, value, label}] | optional chips |
-| sections | [{heading, items: [item], empty}] | quest lists; `empty` = text when items is empty |
-| item | see below | |
-| xp | [{name, done, total}] | optional XP bars (weekly) |
-| callout | {label, text} | 2-minute start for cards whose items have no `start` (older data) |
-| note | string | optional small line at the bottom |
-| url | string | board URL for "Board" (default: the Quest Log board) |
-| display | "full" \| "compact" | how the card opens (default full) |
+| kind | `"morning"` \| `"midday"` \| `"evening"` \| `"weekly"` \| `"urgent"` | colour theme and icon; urgent = the deadline card |
+| eyebrow, title, subtitle | string | header lines (subtitle optional) |
+| progress | `{done, total}` | optional stamina wheel |
+| stats | `[{icon, value, label}]` | optional chips |
+| sections | `[{heading, items, empty}]` | quest lists; `empty` = text when there are no items |
+| xp | `[{name, done, total}]` | optional progress bars per questline (weekly) |
+| callout | `{label, text}` | a 2-minute start for older data without `start` |
+| note | string | small line at the bottom |
+| url | string | board link for "Board" |
+| display | `"full"` \| `"compact"` | full screen (default) or corner card |
 | timeoutSec | number | auto-close, default 1800 |
+| sound | string | `""` mutes the card |
 
-Item: `{type: "main"|"side"|"fun", title, label?, tags?: [string], live?, done?, url?, status?, date?, start?, questline?, goal?, energy?, steps?}`
+Item: `{type: "main"|"side"|"fun", title, url?, status?, date?, label?, tags?, live?, done?, start?, questline?, goal?, energy?, steps?}`
 
-- `label`: day chip like "Mon 26/10"; `live`: "in progress"; `done`: dimmed with a mint check.
-- `url`: the quest's Notion page (`https://app.notion.com/p/<32 hex id>`). Without it the row
-  can't be opened or changed.
-- `status`: Notion Status exactly ("📜 To Do", "🔥 Grinding", "⏸ Delay", "✅ Cleared"); Undo restores it.
-- `date`: the quest's Date, `YYYY-MM-DD`; needed for "Move to tomorrow" (and its undo).
-- `start`: the quest's "2-Min Start" (wrap shell commands in backticks); shown as the next step.
-- `questline`, `goal` (the questline's "Done means"), `energy` ("🐸 Mobs" / "🐉 Boss"): pane and detail panel.
-- `steps`: the questline's quests `[{title, url?, date?, done?}]`, shown as the questline log.
+- `url`: the quest's Notion page; without it the row can't be opened or changed.
+- `status`: the Notion Status exactly; Undo restores it. `date` (`YYYY-MM-DD`) is needed for "Move to tomorrow".
+- `start`: the 2-Min Start (wrap shell commands in backticks). `steps`: the questline's quests `[{title, url?, date?, done?}]`.
 
-All card text is English (day labels Mon–Sun).
+Sounds: put your own files in `sounds/custom/` (same names as in `sounds/`, `.wav` `.aiff` `.caf` `.m4a` `.mp3`) to
+replace the built-in ones; they stay on your Mac (`.gitignore`).
+</details>
+
+<details>
+<summary><b>Tests</b></summary>
+
+```bash
+tests/run.sh
+```
+
+About 230 checks (time windows, catch-up, queue and sync, deadlines, quick add, phone push, evening numbers…) in a
+throw-away sandbox: a temp copy of the scripts, a fake `questcard` and `osascript`, the network stubbed. It touches no
+real state and sends nothing to Notion or ntfy.sh.
+</details>
+
+## Credits
+
+A fan-made personal project inspired by the menu style of *The Legend of Zelda: Tears of the Kingdom*. Not affiliated
+with or endorsed by Nintendo. No game assets are used: every illustration is original SVG drawn in `card.html`, and
+every sound is synthesized by `make_sounds.py`.

@@ -785,56 +785,57 @@
     weekly: '<svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="16" cy="16" r="11"/><path d="M16 5v3M16 24v3M5 16h3M24 16h3"/><path d="M19.5 12.5l-2.2 5.3-5.3 2.2 2.2-5.3z" fill="currentColor"/></svg>'
   };
 
-  const U = (hex) => "https://app.notion.com/p/3fe207ad5a6f81" + hex;   // sample page urls (preview only)
-  const UNBOUND_STEPS = [
-    { title: "Commit Unbound Pawn snapshot + 10-min test run", date: "2026-10-19", url: U("c98a7df601085dd301") },
-    { title: "Playtest Unbound Pawn #1 + decide 5 tasks", date: "2026-10-21" },
-    { title: "Playtest Unbound Pawn #2 + decide 5 more tasks", date: "2026-10-26" },
-    { title: "Write Unbound Pawn's next-week plan (1 line)" } ];
-  const COMMIT = { type: "main", title: "Commit Unbound Pawn snapshot + 10-min test run", url: U("c98a7df601085dd301"), status: "📜 To Do", date: "2026-10-19",
-    energy: "🐸 Mobs", questline: "Unbound Pawn", goal: "No new features: 1 snapshot commit, ≥1 playtest with log, ≥10 tasks decided", steps: UNBOUND_STEPS,
-    start: "Terminal: cd into Games/2d-hess-game-rpg, run `git status --short | head -40`. Check .gitignore has .godot/ before committing." };
-  const KONO = { type: "fun", title: "Read Konosuba final chapter (first half)", url: U("7195e6fcb9d415a6e7"), status: "📜 To Do", date: "2026-10-19", energy: "🐸 Mobs",
-    questline: "Konosuba", goal: "Finish the final chapter", start: "Open the right page, read 1 page. Note where you stopped at the end.",
-    steps: [{ title: "Read Konosuba final chapter (first half)", date: "2026-10-19", url: U("7195e6fcb9d415a6e7") }, { title: "Finish Konosuba's final chapter", date: "2026-10-21" }] };
-  const MASTERS = { type: "main", title: "Define master's criteria + longlist ≤5 programs", url: U("aa11bb22cc33dd44ee"), status: "📜 To Do", date: "2026-10-20", energy: "🐉 Boss",
-    questline: "Master's Decision", goal: "1-page memo: A (apply) / B (postpone, revisit 22/11) / C (no), by Sun 25/10",
-    start: "Open notes, type 3 headings: Why / Constraints / Criteria. Write only, no browsing.",
-    steps: [{ title: "Define master's criteria + longlist ≤5 programs", date: "2026-10-20", url: U("aa11bb22cc33dd44ee") }, { title: "Compare ≤3 master's programs (cost, deadline, entry)", date: "2026-10-22" },
-            { title: "Score master's options + draft A/B/C decision", date: "2026-10-24" }, { title: "Write master's decision memo (A/B/C)", date: "2026-10-25" }] };
-  const GIG = { type: "fun", title: "Play Cyberpunk: 1 gig (max 45 min)", url: U("bb11cc22dd33ee44ff"), status: "📜 To Do", date: "2026-10-20", energy: "🐸 Mobs", questline: "Play Cyberpunk",
-    goal: "Weekdays: 1 gig, max 45 min. Weekend: long sessions. Always stop on time.", start: "Pick ONE gig before launching. 45-min timer + alarm at 21:45. Quit the game when it rings." };
+  const U = (n) => "https://app.notion.com/p/" + String(n).padStart(32, "0");   // made-up page urls (preview only)
+  const NOVEL_STEPS = [
+    { title: "Outline chapters 1–2", date: "2026-10-30", url: U(11), done: true },
+    { title: "Draft chapter 3 outline", date: "2026-11-02", url: U(1) },
+    { title: "Write chapter 3, scene 1", date: "2026-11-05", url: U(12) },
+    { title: "Write chapter 3, scene 2", date: "2026-11-07", url: U(13) } ];
+  const OUTLINE = { type: "main", title: "Draft chapter 3 outline", url: U(1), status: "📜 To Do", date: "2026-11-02", energy: "🐉 Boss",
+    questline: "Novel Draft", goal: "A first draft of 10 chapters by December", steps: NOVEL_STEPS,
+    start: "Open the draft doc and write three bullet points for the opening scene." };
+  const RUN = { type: "fun", title: "30-minute run in the park", url: U(2), status: "📜 To Do", date: "2026-11-02", energy: "🐸 Mobs",
+    questline: "Fitness", goal: "Run 3 times a week", start: "Put on the running shoes and step outside." };
+  const DENTIST = { type: "side", title: "Book a dentist appointment", url: U(3), status: "📜 To Do", date: "2026-11-02", energy: "🐸 Mobs",
+    start: "Open the clinic website and pick the first free slot." };
+  const BUG = { type: "main", title: "Fix the sign-up form bug", url: U(4), status: "📜 To Do", date: "2026-11-03", energy: "🐉 Boss",
+    questline: "Portfolio Site", goal: "Site online with 3 finished projects", start: "Run `npm test` and read the first failing test, nothing else.",
+    steps: [{ title: "Set up the project", date: "2026-10-28", url: U(21), done: true }, { title: "Fix the sign-up form bug", date: "2026-11-03", url: U(4) },
+            { title: "Write the About page", date: "2026-11-06", url: U(22) }] };
+  const SPANISH = { type: "fun", title: "Spanish: lesson 12 (20 min)", url: U(5), status: "📜 To Do", date: "2026-11-03", energy: "🐸 Mobs",
+    questline: "Spanish", goal: "Finish the A2 course", start: "Open the app and play the first audio clip." };
   const SAMPLES = {
-    morning: { kind: "morning", eyebrow: "Morning briefing · Mon 19/10", title: "Today · Mon 19/10", subtitle: "2 quests to do · win the day = clear 1 ⭐",
-      progress: { done: 0, total: 2 },
-      sections: [{ heading: "Today", items: [Object.assign({ tags: ["↩︎ from yesterday"] }, COMMIT), KONO] }],
+    morning: { kind: "morning", eyebrow: "Morning briefing · Tue 03/11", title: "Today · Tue 03/11", subtitle: "3 quests to do · win the day = clear 1 ⭐",
+      progress: { done: 0, total: 3 },
+      sections: [{ heading: "Today", items: [BUG, Object.assign({ tags: ["↩︎ from yesterday"] }, OUTLINE), SPANISH] }],
       note: "⭐ first, 🎮 after. Use a quest's status slot to update it." },
-    midday: { kind: "midday", eyebrow: "Midday check · Tue 20/10", title: "2 quests left for tonight", subtitle: "Start the ⭐ quest as soon as you're home.",
-      sections: [{ items: [Object.assign({}, MASTERS, { live: true, status: "🔥 Grinding" }), GIG] }] },
-    evening: { kind: "evening", eyebrow: "Evening report · Mon 19/10", title: "Tomorrow: 2 ⭐ + 1 🎮", subtitle: "No worries, ⭐ first tomorrow. Sleep on time 🛌",
-      progress: { done: 1, total: 2 },
-      stats: [{ icon: "✅", value: "1/2", label: "quests" }, { icon: "⭐", value: "❌", label: "main" }, { icon: "⏸", value: "0", label: "moved" }, { icon: "🔥", value: "2", label: "day streak" }],
+    midday: { kind: "midday", eyebrow: "Midday check · Tue 03/11", title: "2 quests left for tonight", subtitle: "Start the ⭐ quest as soon as you're home.",
+      sections: [{ items: [Object.assign({}, BUG, { live: true, status: "🔥 Grinding" }), SPANISH] }] },
+    evening: { kind: "evening", eyebrow: "Evening report · Mon 02/11", title: "Tomorrow: 2 ⭐ + 1 🎮", subtitle: "No worries, ⭐ first tomorrow. Sleep on time 🛌",
+      progress: { done: 2, total: 3 },
+      stats: [{ icon: "✅", value: "2/3", label: "quests" }, { icon: "⭐", value: "❌", label: "main" }, { icon: "⏸", value: "0", label: "moved" }, { icon: "🔥", value: "4", label: "day streak" }],
       sections: [
-        { heading: "Today", items: [Object.assign({ tags: ["→ rolls to tomorrow"] }, COMMIT), Object.assign({}, KONO, { done: true, status: "✅ Cleared" })] },
-        { heading: "Tomorrow · Tue 20/10", items: [MASTERS, Object.assign({ tags: ["↩︎"] }, COMMIT), GIG] } ] },
-    urgent: { kind: "urgent", display: "compact", eyebrow: "Last call", title: "Submit the visa form", subtitle: "Due Today 17:00 · in 14 min",
+        { heading: "Today", items: [Object.assign({ tags: ["→ rolls to tomorrow"] }, OUTLINE), Object.assign({}, RUN, { done: true, status: "✅ Cleared" }),
+                                    Object.assign({}, DENTIST, { done: true, status: "✅ Cleared" })] },
+        { heading: "Tomorrow · Tue 03/11", items: [Object.assign({ tags: ["↩︎"] }, OUTLINE), BUG, SPANISH] } ] },
+    urgent: { kind: "urgent", display: "compact", eyebrow: "Last call", title: "Renew the passport application", subtitle: "Due Today 17:00 · in 14 min",
       sections: [{ heading: "Due soon", items: [
-        { type: "main", title: "Submit the visa form", url: U("0102030405060708b1"), status: "📜 To Do", label: "in 14 min", tags: ["Due Today 17:00"],
-          start: "Open the embassy portal and upload the 3 scans." },
-        { type: "side", title: "Pay the rent", url: U("0102030405060708b2"), status: "📜 To Do", label: "in 2h 10m", tags: ["Due Today 19:00"] } ] }],
+        { type: "main", title: "Renew the passport application", url: U(31), status: "📜 To Do", label: "in 14 min", tags: ["Due Today 17:00"],
+          start: "Open the government portal and upload the photo." },
+        { type: "side", title: "Pay the electricity bill", url: U(32), status: "📜 To Do", label: "in 2h 10m", tags: ["Due Today 19:00"] } ] }],
       note: "Snooze holds the alerts for 15 minutes." },
-    weekly: { kind: "weekly", eyebrow: "Weekly reset · Sun 25/10", title: "The new week is ready", subtitle: "🔁 Moved 8 · ⬆️ Promoted 1 · 🆕 Created 2",
-      progress: { done: 9, total: 17 },
-      stats: [{ icon: "✅", value: "9/17", label: "quests" }, { icon: "⭐", value: "5/7", label: "days" }, { icon: "🎮", value: "6", label: "play sessions" }, { icon: "🔁", value: "8", label: "carried" }],
-      xp: [{ name: "Master's", done: 4, total: 4 }, { name: "Unbound Pawn", done: 2, total: 4 }, { name: "AI Fintech", done: 1, total: 4 }, { name: "Economics", done: 2, total: 3 }],
+    weekly: { kind: "weekly", eyebrow: "Weekly reset · Sun 08/11", title: "The new week is ready", subtitle: "🔁 Moved 3 · ⬆️ Promoted 1 · 🆕 Created 2",
+      progress: { done: 11, total: 16 },
+      stats: [{ icon: "✅", value: "11/16", label: "quests" }, { icon: "⭐", value: "5/7", label: "days" }, { icon: "🎮", value: "6", label: "play sessions" }, { icon: "🔁", value: "3", label: "carried" }],
+      xp: [{ name: "Novel Draft", done: 3, total: 10 }, { name: "Portfolio Site", done: 2, total: 4 }, { name: "Spanish", done: 5, total: 8 }, { name: "Fitness", done: 3, total: 3 }],
       sections: [{ heading: "Next week", items: [
-        { type: "main", label: "Mon 26/10", date: "2026-10-26", title: "Playtest Unbound Pawn #2 + decide 5 more tasks", tags: ["↩︎"], url: U("0102030405060708a1"), status: "📜 To Do", energy: "🐉 Boss", questline: "Unbound Pawn", start: "Launch the build, play 1 full match, write 3 notes.", steps: UNBOUND_STEPS },
-        { type: "main", label: "Tue 27/10", date: "2026-10-27", title: "Add \"Explain simply\" button to the economic calendar", url: U("0102030405060708a2"), status: "📜 To Do", energy: "🐉 Boss", questline: "AI Fintech" },
-        { type: "main", label: "Wed 28/10", date: "2026-10-28", title: "Write 1-page economics cheat sheet (CPI, interest rates)", url: U("0102030405060708a3"), status: "📜 To Do", energy: "🐸 Mobs", questline: "Economics" },
-        { type: "main", label: "Thu 29/10", date: "2026-10-29", title: "Fact-check AI explanations on 3 real events", url: U("0102030405060708a4"), status: "📜 To Do", energy: "🐉 Boss", questline: "AI Fintech" },
-        { type: "main", label: "Fri 30/10", date: "2026-10-30", title: "Explain 1 economic event in 5 sentences", tags: ["⬆️"], url: U("0102030405060708a5"), status: "📜 To Do", energy: "🐸 Mobs", questline: "Economics" },
-        { type: "main", label: "Sat 31/10", date: "2026-10-31", title: "Ship AI explain: rate limit + env flag + README + push", url: U("0102030405060708a6"), status: "📜 To Do", energy: "🐉 Boss", questline: "AI Fintech" },
-        { type: "main", label: "Sun 01/11", date: "2026-11-01", title: "Write Unbound Pawn's next-week plan (1 line)", tags: ["🆕"], url: U("0102030405060708a7"), status: "📜 To Do", energy: "🐉 Boss", questline: "Unbound Pawn" } ] }],
+        { type: "main", label: "Mon 09/11", date: "2026-11-09", title: "Write chapter 3, scene 1", tags: ["↩︎"], url: U(12), status: "📜 To Do", energy: "🐉 Boss", questline: "Novel Draft", start: "Open the draft doc and write the first sentence.", steps: NOVEL_STEPS },
+        { type: "main", label: "Tue 10/11", date: "2026-11-10", title: "Write the About page", url: U(22), status: "📜 To Do", energy: "🐸 Mobs", questline: "Portfolio Site" },
+        { type: "main", label: "Wed 11/11", date: "2026-11-11", title: "Write chapter 3, scene 2", url: U(13), status: "📜 To Do", energy: "🐉 Boss", questline: "Novel Draft" },
+        { type: "main", label: "Thu 12/11", date: "2026-11-12", title: "Add the projects page", url: U(23), status: "📜 To Do", energy: "🐉 Boss", questline: "Portfolio Site" },
+        { type: "main", label: "Fri 13/11", date: "2026-11-13", title: "Review chapter 3 notes", tags: ["⬆️"], url: U(14), status: "📜 To Do", energy: "🐸 Mobs", questline: "Novel Draft" },
+        { type: "main", label: "Sat 14/11", date: "2026-11-14", title: "Deploy the portfolio site", url: U(24), status: "📜 To Do", energy: "🐉 Boss", questline: "Portfolio Site" },
+        { type: "main", label: "Sun 15/11", date: "2026-11-15", title: "Outline chapter 4", tags: ["🆕"], url: U(15), status: "📜 To Do", energy: "🐉 Boss", questline: "Novel Draft" } ] }],
       note: "🎮 Every day has at least 1 Fun." }
   };
 

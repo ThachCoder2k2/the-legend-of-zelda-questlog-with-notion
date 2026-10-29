@@ -6,6 +6,8 @@
 //   status actions the menu lists today's open quests (from runs/today.json, written whenever a card is shown); each has
 //                  Clear / Track / Move to tomorrow / Open. The change is queued in pending.json like a card click, and
 //                  `report.py apply` writes it to Notion right away when the token is saved.
+//   not saved yet  "⏳ N changes not in Notion yet: save now" while pending.json holds clicks (the catch-up agent also
+//                  retries them every 10 min); "⚠ Notion isn't connected (N changes waiting)" while the token is missing
 //   tracking       a quest you hit Track on (🔥 Grinding, from pending.json / applied.json) shows "▶ 12m" next to the icon
 //   ⌃⌥D            Add deadline…: one line ("Submit visa form, tomorrow 9am") becomes a quest with a Due in Notion
 //
@@ -176,6 +178,7 @@ final class Bar: NSObject, NSApplicationDelegate {
     var pulse = true               // the red "!" blinks
     var pulseTimer: Timer?
     var lastIconKey = ""
+    var waiting = 0                // clicks in pending.json that are not in Notion yet (the catch-up agent retries them)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -290,9 +293,17 @@ final class Bar: NSObject, NSApplicationDelegate {
             }
             menu.addItem(.separator())
         }
+        let changes = waiting == 1 ? "1 change" : "\(waiting) changes"
         if !notionOK {
-            let m = NSMenuItem(title: "⚠  Notion isn't connected: set it up…", action: #selector(openSetup), keyEquivalent: "")
+            let waits = waiting > 0 ? " (\(changes) waiting)" : ""
+            let m = NSMenuItem(title: "⚠  Notion isn't connected\(waits): set it up…", action: #selector(openSetup), keyEquivalent: "")
             m.target = self
+            menu.addItem(m)
+            menu.addItem(.separator())
+        } else if waiting > 0 {
+            let m = NSMenuItem(title: "⏳  \(changes) not in Notion yet: save now", action: #selector(saveNow), keyEquivalent: "")
+            m.target = self
+            m.toolTip = "Retried by itself every 10 minutes and after a wake-up; runs/catchup and runs/bar logs say why it failed."
             menu.addItem(m)
             menu.addItem(.separator())
         }
@@ -342,9 +353,12 @@ final class Bar: NSObject, NSApplicationDelegate {
         }
         if !running.isEmpty { text = " …" }   // a click is being served (building the card can take a few seconds)
         checkToken()
+        waiting = queuedCount()
         if !notionOK {
             text += " ⚠"
-            tip = "Quest Log: Notion isn't connected (no token in the Keychain), so live cards, deadlines and quick add are off · right-click to set it up"
+            tip = "Quest Log: Notion isn't connected (no token in the Keychain), so clicks wait in the queue and live cards, deadlines and quick add are off · right-click to set it up"
+        } else if waiting > 0 {
+            tip += " · \(waiting) change\(waiting == 1 ? "" : "s") not in Notion yet"
         }
         if let f = flash, f.until > Date() {
             text = " " + f.text
@@ -356,7 +370,7 @@ final class Bar: NSObject, NSApplicationDelegate {
             let more = urgent.filter { $0.level() > 0 }.count - 1
             tip = "! \(first.title): \(first.countdown())" + (more > 0 ? " (+\(more) more)" : "") + " · click to open"
         }
-        let key = "\(text == " ✓")-\(worst)-\(worst >= 3 ? pulse : true)-\(notionOK)-\(tracking?.id ?? "")-\(todayItems.map { $0.id }.joined())"
+        let key = "\(text == " ✓")-\(worst)-\(worst >= 3 ? pulse : true)-\(notionOK)-\(waiting)-\(tracking?.id ?? "")-\(todayItems.map { $0.id }.joined())"
         if key != lastIconKey {   // redraw only when something changed
             lastIconKey = key
             item.button?.image = icon(done: text == " ✓", level: worst, pulse: pulse)
@@ -491,6 +505,22 @@ final class Bar: NSObject, NSApplicationDelegate {
     }
 
     /// Opens set-notion-token.command in Terminal: the token is typed there, so it never passes through this app.
+    /// The menu's "not in Notion yet: save now": write the queue right away (`report.py apply`).
+    @objc func saveNow() {
+        flash = ("…", Date().addingTimeInterval(3))
+        lastIconKey = ""
+        refresh()
+        runPython(["apply"])
+    }
+
+    /// Clicks in pending.json (card or menu) that are not in Notion yet.
+    func queuedCount() -> Int {
+        guard let data = try? Data(contentsOf: queueFile),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let list = obj["actions"] as? [[String: Any]] else { return 0 }
+        return list.filter { ($0["id"] as? String)?.count == 32 && $0["status"] is String }.count
+    }
+
     @objc func openSetup() {
         NSWorkspace.shared.open(setupScript)
         lastTokenCheck = Date.distantPast   // look again soon: it may be saved in a minute

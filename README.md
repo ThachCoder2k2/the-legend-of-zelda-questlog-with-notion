@@ -143,11 +143,18 @@ Keys work only after you click the card once, so typing in another app never rea
 
 ## Saving "done" to Notion
 
-The card has no Notion access of its own, so a click is saved one of two ways:
+With the Notion token saved (steps below), the Mac writes every click on the card or in the menu bar to Notion itself,
+within seconds: no Claude task is involved. A click that can't be written right away (offline, Notion down, the card
+closed first) waits in `pending.json`; the catch-up agent writes it at login, after a wake-up and every 10 minutes (in
+shadow and live mode alike), and until then the menu bar lists "⏳ N changes not in Notion yet: save now".
 
-1. **Queued (default):** written to `pending.json` (status, plus date for a move); the next scheduled Quest Log task
-   (07:30, 12:00, 22:00, Sunday 22:30) applies it through the Notion connector first thing.
-2. **Instant (optional):** give the card its own Notion integration token.
+Without the token a click only waits in `pending.json` (menu: "⚠ Notion isn't connected (N changes waiting)") until a
+Claude task (07:30, 12:00, 22:00, Sunday 22:30) applies it through the Notion connector, so with no Claude task running
+nothing changes in Notion. That is why the token matters:
+
+1. **Queued (no token):** written to `pending.json` (status, plus date for a move); the next scheduled Quest Log task
+   applies it through the Notion connector first thing.
+2. **Instant (token):** give the card its own Notion integration token.
    1. Notion → Settings → Connections → Develop or manage integrations → New integration
       (internal, your workspace, capabilities: Read, Update **and Insert** content; Insert is what "Add deadline…" needs). Copy the secret.
    2. Open the page **🗂️ Quest Log Data** → ••• → Connections → add that integration. That page holds the
@@ -168,6 +175,11 @@ questlog-morning-report, questlog-evening-reminder and questlog-evening-report (
 step by step, including step 0 (queued clicks are written to Notion and recorded in applied.json through
 `pending.py done`). The Sunday weekly reset stays a Claude task: it needs planning judgement.
 
+**Running without Claude.** Once the token works and `install --live` is done, Claude is only the weekly planner:
+saving clicks, the 07:30 / 12:00 / 22:00 cards, the catch-up after sleep, deadlines and the menu bar all run on the
+Mac. If the Sunday plan doesn't run, the week goes on: unfinished quests show up as carried ("↩︎") on the next
+morning card until you re-plan.
+
 | command | does |
 |---|---|
 | `python3 report.py morning` (or `midday`, `evening`) | apply queued clicks, read Notion, show the card |
@@ -177,7 +189,7 @@ step by step, including step 0 (queued clicks are written to Notion and recorded
 | `python3 report.py install` / `install --live` / `uninstall` | LaunchAgents at 07:30, 12:00, 22:00 (`~/Library/LaunchAgents/com.questlog.report.*.plist`) |
 | `python3 report.py check` | token, Notion access, row counts |
 
-**Shadow mode (installed now).** The LaunchAgents show nothing and write nothing to Notion. Each one waits for
+**Live since 29/10/2026** (the three Claude tasks morning, midday and evening are turned off). **Shadow mode** (the earlier trial setup): The LaunchAgents show nothing and write no cards' changes to Notion (the catch-up still writes queued clicks). Each one waits for
 the Claude task's card, builds ours at that moment and appends the result to `runs/compare.log`
 (differences in `runs/DATE-KIND.diff.txt`). Once a few days read `MATCH`, go live (first `touch runs/DATE-morning.shown runs/DATE-midday.shown` for the cards of
 today you already saw, or the catch-up shows them again):

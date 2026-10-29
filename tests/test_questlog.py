@@ -549,7 +549,41 @@ applied_with = []
 report.read_token = lambda: "secret"; real_apply = report.apply_queue
 report.apply_queue = lambda token: applied_with.append(token)
 check("report.py apply with a token writes the queue", report.apply_cmd() == 0 and applied_with == ["secret"])
+
+print("== sync: queued clicks reach Notion without Claude (catch-up agent, any mode)")
+import pending as _pending
+token_reads = []
+def _tok(v):
+    def f():
+        token_reads.append(1); return v
+    return f
+def _queue(actions): json.dump({"version": 1, "actions": actions}, open(_pending.QUEUE, "w"))
+qclick = {"id": "d" * 32, "status": "✅ Cleared", "title": "Queued clear", "at": "2026-10-20T09:00:00.000Z"}
+_queue([]); applied_with.clear(); report.read_token = _tok("secret")
+check("sync, empty queue: no Keychain read, nothing written", report.sync_queue() == 0 and token_reads == [] and applied_with == [])
+_queue([qclick]); report.read_token = _tok(None)
+check("sync, a queued click but no token: nothing written, exit 0", report.sync_queue() == 0 and applied_with == [])
+report.read_token = _tok("secret")
+check("sync, a queued click and a token: the queue is written", report.sync_queue() == 0 and applied_with == ["secret"])
+reset(); qlstate.set_mode("shadow"); applied_with.clear()
+report.catchup(ns(at=f"{D} 13:00")); check("catch-up in SHADOW mode still writes the queue (saving never waits for Claude)", applied_with == ["secret"], applied_with)
+applied_with.clear(); report.catchup(ns(at=f"{D} 13:00", dry_run=True)); check("catch-up --dry-run writes nothing", applied_with == [])
+report.apply_queue = lambda token: (_ for _ in ()).throw(RuntimeError("boom"))
+check("sync: an unexpected error is logged, exit 1, no crash", report.sync_queue() == 1)
+_queue([]); report.read_token = lambda: None
 report.apply_queue = real_apply
+# end to end, Claude off: a Clear made while offline is written by the next catch-up once Notion answers
+patched = []
+def notion_down(token, method, path, body=None, tries=4): raise report.NotionError(0, "unreachable")
+def notion_up(token, method, path, body=None, tries=4): patched.append((method, path, body)); return {}
+_queue([qclick]); report.read_token = lambda: "secret"; real_notion = report.notion
+report.notion = notion_down; reset(); qlstate.set_mode("shadow"); report.catchup(ns(at=f"{D} 13:00"))
+check("offline: the click stays queued", len(json.load(open(_pending.QUEUE))["actions"]) == 1)
+report.notion = notion_up; report.catchup(ns(at=f"{D} 13:10"))
+check("back online: the next catch-up PATCHes the page's Status", patched == [("PATCH", "/pages/" + "d" * 32, {"properties": {"Status": {"status": {"name": "✅ Cleared"}}}})], patched)
+check("  the queue is empty and applied.json has it (the evening stats read it)",
+      json.load(open(_pending.QUEUE))["actions"] == [] and any(e["id"] == "d" * 32 and e["status"] == "✅ Cleared" for e in json.load(open(_pending.LEDGER))["applied"]))
+report.notion = real_notion; report.read_token = lambda: None; _queue([])
 
 print("== ledger keeps the title (the bar's tracking timer reads it)")
 import subprocess as sp, tempfile, shutil

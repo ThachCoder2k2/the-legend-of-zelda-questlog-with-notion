@@ -22,9 +22,10 @@ Notion"). Python 3.9+ standard library only.
   python3 report.py now [KIND]         open a card right now (the menu-bar button): the live card, or the last saved one
                                        when Notion is unreachable. KIND defaults to the one for the time of day
                                        (morning / midday / evening / weekly = the last weekly card)
-  python3 report.py catchup            LaunchAgent (at login and every 10 min): refresh the deadlines and show the urgent
-                                       card if one is due; show the one card that is due and unseen once you are back at
-                                       the Mac (not while another card is open); live mode only
+  python3 report.py catchup            LaunchAgent (at login and every 10 min): write the queued clicks to Notion (any
+                                       mode), refresh the deadlines and show the urgent card if one is due; show the one
+                                       card that is due and unseen once you are back at the Mac (not while another card
+                                       is open; live mode only)
   python3 report.py gate KIND          for the Claude tasks: "go DATE" or "skip: why" (outside the window, already shown,
                                        or the local runner is live and shows it)
   python3 report.py status             mode, token, which cards were shown today, the saved cards
@@ -935,10 +936,31 @@ def _no_card(kind, title, text):
             "display": "compact"}
 
 
+def sync_queue():
+    """Clicks that could not be written right away (offline, Notion down, the card closed first) go to Notion from here:
+    the catch-up agent runs it at login, after a wake-up and every 10 minutes, in shadow and live mode alike, so saving a
+    click never waits for a Claude task or for the next card. Quiet when nothing is queued (no Keychain read, no network)."""
+    waiting = queued()
+    if not waiting:
+        return 0
+    token = read_token()
+    if not token:
+        log(f"sync: {len(waiting)} click(s) queued, no Notion token in the Keychain (README: Saving \"done\" to Notion)")
+        return 0
+    try:
+        apply_queue(token)
+    except Exception as e:  # noqa: BLE001
+        log(f"sync: {e!r}")
+        return 1
+    return 0
+
+
 def catchup(args):
-    """After sleep, a shutdown or a late login: show the one card that is due and unseen, once the user is back."""
+    """After sleep, a shutdown or a late login: write queued clicks to Notion, then show the one card that is due and
+    unseen, once the user is back."""
     now = _at(args)
     if not args.dry_run:
+        sync_queue()                              # any mode: a click must reach Notion without Claude
         deadline_tick(now if args.at else None)   # deadlines come first: the ladder has its own presence rules
     wanted = qlstate.due(now)
     if not wanted:
